@@ -335,11 +335,15 @@ def main():
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
 
-  # warmup the JIT
+  # warmup the JIT (compile + capture once, hit cache thereafter)
   if args.warmup or args.serve:
-    # run 2 tokens through the model twice to capture the JIT before serving
     with Context(DEBUG=max(DEBUG.value, 1)):
-      for _ in range(2): list(zip(range(2), model.generate([0])))
+      for _ in range(2):
+        if args.mtp and model.mtp_heads:
+          # warm the MTP-specific JITs (verify T=K+1, mtp_main, mtp_draft) at the requested K
+          list(zip(range(2), model.generate_mtp([0], k=args.mtp)))
+        else:
+          list(zip(range(2), model.generate([0])))
 
   if args.mtp and not model.mtp_heads:
     print(f"warning: --mtp {args.mtp} requested but model has no MTP heads; falling back to standard decode")

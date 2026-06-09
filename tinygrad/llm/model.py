@@ -363,10 +363,14 @@ class GatedDeltaNetBlock(FFNBlock):
     # the store side effects through the returned core_attn_in.
     post_state = Tensor(self.recurrent_state.uop.after(*stores)).float()                  # (B,H,D,D)
     core_list[-1] = (post_state @ q[:, -1]).squeeze(-1)                                   # (B,H,D)
-    core_attn_in = Tensor.stack(*core_list, dim=1)                                        # (B,T,H,D)
+    # .contiguous() after stack forces the scheduler to materialize core_attn_in as a single
+    # (B,T,H,D) tensor instead of T disjoint sub-graphs. Without it, downstream ops (ssm_norm,
+    # ssm_out, the residual add into FFN) inherit T separate sub-graphs and fire per-T kernels
+    # instead of one T-batched kernel.
+    core_attn_in = Tensor.stack(*core_list, dim=1).contiguous()                           # (B,T,H,D)
 
     core_attn_out = self.ssm_norm(core_attn_in)
-    return self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, T, -1).cast(x.dtype))
+    return self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, T, -1).cast(x.dtype)).contiguous()
 
   # recurrent state can't be partially reused after divergence, force a full rebuild
   def _state_reset_ops(self):
