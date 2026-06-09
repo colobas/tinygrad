@@ -435,9 +435,12 @@ class MTPHead:
     self.hnorm = nn.RMSNorm(config.dim, config.norm_eps)
     self.eh_proj = nn.Linear(2 * config.dim, config.dim, bias=False)
     self.block = TransformerBlock(config)
+    # MTP-specific final norm before the (shared) lm_head. NOT tied to main output_norm.
+    self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
 
   def __call__(self, h_prev:Tensor, tok_embed:Tensor, start_pos:int|UOp) -> Tensor:
-    fused = self.eh_proj(self.hnorm(h_prev).cat(self.enorm(tok_embed), dim=-1))
+    # Concat order: [enorm(embed); hnorm(h_prev)] per Qwen3 MTP convention (opposite of DeepSeek-V3).
+    fused = self.eh_proj(self.enorm(tok_embed).cat(self.hnorm(h_prev), dim=-1))
     return self.block(fused, start_pos)
 
 class Transformer:
@@ -515,7 +518,8 @@ class Transformer:
       tok_embed = self.token_embd(tok).float()
       h = self.mtp_heads[head_idx](head_h_prev, tok_embed, start_pos)       # (1, 1, D)
       self._mtp_h_buf.assign(h.cast(self._mtp_h_buf.dtype))
-      return self._gumbel_argmax(self.output(self.output_norm(h))[:, -1, :], temperature)
+      # MTP-specific final norm (not main output_norm); shares lm_head with main.
+      return self._gumbel_argmax(self.output(self.mtp_heads[head_idx].shared_head_norm(h))[:, -1, :], temperature)
     return _step
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
@@ -561,10 +565,12 @@ class Transformer:
         head_idx, rest = bi - main_blocks, m.group(2)
         if rest in ('nextn.enorm.weight', 'nextn.hnorm.weight', 'nextn.eh_proj.weight'):
           state_dict[f'mtp_heads.{head_idx}.{rest.split(".",1)[1]}'] = state_dict.pop(name)
-        elif rest in ('nextn.shared_head_norm.weight', 'nextn.shared_head.norm.weight',
-                      'nextn.shared_head.head.weight', 'nextn.embed_tokens.weight',
-                      'embed_tokens.weight', 'shared_head.norm.weight', 'shared_head.head.weight'):
-          # tied to main token_embd / output_norm / output — drop the dedicated copy
+        elif rest in ('nextn.shared_head_norm.weight', 'nextn.shared_head.norm.weight', 'shared_head.norm.weight'):
+          # NOT tied to main output_norm — distinct weights. Load into per-head shared_head_norm.
+          state_dict[f'mtp_heads.{head_idx}.shared_head_norm.weight'] = state_dict.pop(name)
+        elif rest in ('nextn.shared_head.head.weight', 'nextn.embed_tokens.weight',
+                      'embed_tokens.weight', 'shared_head.head.weight'):
+          # tied to main token_embd / lm_head — drop the dedicated copy
           del state_dict[name]
         else:
           # standard transformer-block weights live under .block.*
@@ -677,7 +683,9 @@ class Transformer:
     for blk in self.blk:
       if isinstance(blk, GatedDeltaNetBlock): blk._alloc_history(verify_T)
 
-    mtp_start_pos = 0  # MTP heads have their own cache; we maintain their pointer separately
+    # MTP heads share absolute RoPE position with the main sequence — initialize to the post-prefill position
+    # and advance by the number of committed tokens each iter (accept drafts + 1 verify-bonus).
+    mtp_start_pos = start_pos
     last_committed = tokens[-1]
     # head_h is a stable view of the side-effect buffer; the JIT writes into it each step.
     head_h_view = self._mtp_h_buf
@@ -729,7 +737,7 @@ class Transformer:
       self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :]).realize()
 
       start_pos += accept + 1
-      mtp_start_pos += accept
+      mtp_start_pos += accept + 1
       last_committed = new_tokens[-1]
 
       for nt in new_tokens:
