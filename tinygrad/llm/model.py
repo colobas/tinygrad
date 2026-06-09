@@ -121,6 +121,13 @@ class FFNBlock:
     if getenv("CUSTOM_MLP") and x.device == "AMD" and self.config.dim == 1024 and self.config.hidden_dim == 3584:
       from tinygrad.llm.amd_kernels import fused_gate_up
       return self.ffn_down(fused_gate_up(x, self.ffn_gate.weight, self.ffn_up.weight))
+    # For T>1 (MTP verify) flatten before the FFN matmuls so the scheduler sees one batched
+    # matmul instead of T separate per-position matmuls.
+    B, T, D = x.shape
+    if resolve(T != 1):
+      xf = x.reshape(B*T, D)
+      h = (self.ffn_gate(xf).silu().contiguous() * self.ffn_up(xf))
+      return self.ffn_down(h).reshape(B, T, -1)
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
@@ -155,10 +162,14 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    B, T, _ = x.shape
+    # For T>1 (MTP verify) flatten the batch+T dims before the projections so the scheduler sees
+    # one (T, D) @ (D, D_out) matmul instead of T separate per-position matmuls. Safe to skip
+    # for the T=1 hot path (rollout) where the shape signatures are already well-tuned.
+    x_proj = x.reshape(B*T, -1) if resolve(T != 1) else x
+    q, k, v = self.attn_q(x_proj), self.attn_k(x_proj), self.attn_v(x_proj)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    B, T, _ = x.shape
     if self.config.attn_output_gate:
       qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
       q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
@@ -185,7 +196,11 @@ class TransformerBlock(FFNBlock):
       if resolve(T != 1) else None
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    out_in = attn if not self.config.attn_output_gate else (attn * gate.sigmoid())
+    # Same T-batching trick on the way out so attn_output also runs as one matmul.
+    if resolve(T != 1):
+      return self.attn_output(out_in.reshape(B*T, -1)).reshape(B, T, -1)
+    return self.attn_output(out_in)
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
@@ -315,12 +330,16 @@ class GatedDeltaNetBlock(FFNBlock):
     K = self.ssm_conv_kernel
 
     x = x.half()
-    out_gate = self.attn_gate(x).reshape(B, T, H, D)                                      # (B,T,H,D)
-    beta  = self.ssm_beta(x).sigmoid().reshape(B, T, H).float()                          # (B,T,H)
-    alpha = ((self.ssm_alpha(x).float() + self.ssm_dt["bias"]).softplus() * self.ssm_a).reshape(B, T, H).exp()  # (B,T,H)
+    # EXPERIMENT: feed projections (T, D) instead of (B=1, T, D) so the scheduler sees a single
+    # T-batched matmul rather than treating each T position as its own (1, D) row. This is meant
+    # to attack the per-T kernel inflation seen in DEBUG=4 profiling (same r_* kernels firing 3x).
+    x_flat = x.reshape(B*T, -1)                                                            # (T, D)
+    out_gate = self.attn_gate(x_flat).reshape(B, T, H, D)                                 # (B,T,H,D)
+    beta  = self.ssm_beta(x_flat).sigmoid().reshape(B, T, H).float()                     # (B,T,H)
+    alpha = ((self.ssm_alpha(x_flat).float() + self.ssm_dt["bias"]).softplus() * self.ssm_a).reshape(B, T, H).exp()  # (B,T,H)
 
     # --- depthwise conv over the (K-1 prior + T new) qkv window, producing T outputs ---
-    conv_window = self.conv_state.cat(self.attn_qkv(x), dim=1)                            # (B, K-1+T, C)
+    conv_window = self.conv_state.cat(self.attn_qkv(x_flat).reshape(B, T, -1), dim=1)    # (B, K-1+T, C)
     weight = self.ssm_conv1d["weight"].T.reshape(1, 1, K, -1)                             # (1,1,K,C)
     # Build T sliding windows of length K via Python-level stack (T is a concrete int at trace time).
     windows = Tensor.stack(*[conv_window[:, t:t+K, :] for t in range(T)], dim=1)          # (B,T,K,C)
