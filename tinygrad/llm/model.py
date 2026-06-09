@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, itertools, pathlib
+import functools, itertools, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
@@ -71,6 +71,7 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  num_mtp_heads: int = 0
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -255,7 +256,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
-    assert T == 1, "GatedDeltaNetBlock currently only supports T=1"
+    if resolve(T != 1): return self._attention_tn(x)
 
     # input processing
     x = x.half()
@@ -291,6 +292,82 @@ class GatedDeltaNetBlock(FFNBlock):
     core_attn_out = self.ssm_norm(core_attn_in)
     return self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, 1, -1).cast(x.dtype))
 
+  def _attention_tn(self, x:Tensor) -> Tensor:
+    """T>1 SSM forward used by MTP's K-wide verify pass.
+
+    Projections, convolution, and per-position q/k/v are computed in one parallel matmul over
+    all T inputs (bandwidth amortized). The DeltaNet recurrence itself
+      `S_t = S_{t-1} * alpha_t + (v_t - S_{t-1} @ k_t) * beta_t @ k_t^T`
+    is unrolled sequentially in-graph over T to keep every kernel in the same `(B,H,D,D)`
+    shape signature as the baseline T=1 path. Per-position state is saved to `rs_history`
+    / `cs_history` so generate_mtp can roll back in O(1) on partial accept.
+
+    NOTE: An earlier version used a Hillis-Steele parallel scan, but the resulting
+    `(B,T,H,D,D)` 5D-tensor kernels compiled to suboptimal schedules. The sequential-in-graph
+    form here is mathematically equivalent at small T (K=2–8) with negligible compute overhead
+    and produces kernel shapes the JIT already schedules well.
+    """
+    B, T, _ = x.shape
+    D = self.head_v_dim
+    assert D == self.head_k_dim, "T>1 SSM path requires head_k_dim == head_v_dim"
+    H = self.num_v_heads
+    ratio = H // self.num_k_heads
+    K = self.ssm_conv_kernel
+
+    x = x.half()
+    out_gate = self.attn_gate(x).reshape(B, T, H, D)                                      # (B,T,H,D)
+    beta  = self.ssm_beta(x).sigmoid().reshape(B, T, H).float()                          # (B,T,H)
+    alpha = ((self.ssm_alpha(x).float() + self.ssm_dt["bias"]).softplus() * self.ssm_a).reshape(B, T, H).exp()  # (B,T,H)
+
+    # --- depthwise conv over the (K-1 prior + T new) qkv window, producing T outputs ---
+    conv_window = self.conv_state.cat(self.attn_qkv(x), dim=1)                            # (B, K-1+T, C)
+    weight = self.ssm_conv1d["weight"].T.reshape(1, 1, K, -1)                             # (1,1,K,C)
+    # Build T sliding windows of length K via Python-level stack (T is a concrete int at trace time).
+    windows = Tensor.stack(*[conv_window[:, t:t+K, :] for t in range(T)], dim=1)          # (B,T,K,C)
+    conv_out = (windows * weight).sum(axis=2).silu()                                       # (B,T,C)
+
+    q_part, k_part, v_part = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
+    q = q_part.reshape(B, T, self.num_k_heads, self.head_k_dim).normalize(dim=-1).repeat(1, 1, ratio, 1)
+    k = k_part.reshape(B, T, self.num_k_heads, self.head_k_dim).normalize(dim=-1).repeat(1, 1, ratio, 1)
+    v = v_part.reshape(B, T, H, self.head_v_dim)
+    q = q.mul(self.head_k_dim ** -0.5).unsqueeze(-1).float()                              # (B,T,H,D,1)
+    k = k.unsqueeze(-1).float()
+    v = v.unsqueeze(-1).float()
+
+    # --- recurrent SSM update: sequential-in-graph over T (see class docstring NOTE) ---
+    S = self.recurrent_state.float()                                                      # (B,H,D,D)
+    S_list:list[Tensor] = []
+    core_list:list[Tensor] = []
+    for t in range(T):
+      alpha_t = alpha[:, t].reshape(B, H, 1, 1)
+      beta_t  = beta[:, t].reshape(B, H, 1, 1)
+      q_t, k_t, v_t = q[:, t], k[:, t], v[:, t]                                           # each (B,H,D,1)
+      S = S * alpha_t
+      S = S + ((v_t - S @ k_t) * beta_t) @ k_t.transpose(-1, -2)
+      S_list.append(S)
+      core_list.append((S @ q_t).squeeze(-1))                                             # (B,H,D)
+    # Persist current state (last position) AND per-position history for MTP rollback.
+    # Each store target stays in baseline-shape (no 5D (B,T,H,D,D) intermediates anywhere).
+    final_S = S_list[-1]                                                                  # (B,H,D,D)
+    final_conv = conv_window[:, T:, :]                                                    # (B,K-1,C)
+    recurrent_state_store = self.recurrent_state.uop.store(final_S.cast(self.recurrent_state.dtype).uop)
+    conv_state_store     = self.conv_state.uop.store(final_conv.cast(self.conv_state.dtype).uop)
+    stores = [recurrent_state_store, conv_state_store]
+    if self.rs_history is not None:
+      for t, S_t in enumerate(S_list):
+        stores.append(self.rs_history[t].uop.store(S_t.cast(self.rs_history[t].dtype).uop))
+      for t in range(T):
+        slice_t = conv_window[:, t+1:t+self.ssm_conv_kernel, :]
+        stores.append(self.cs_history[t].uop.store(slice_t.cast(self.cs_history[t].dtype).uop))
+    # Read final_S back via .after(stores) and use it for the last position's output, threading
+    # the store side effects through the returned core_attn_in.
+    post_state = Tensor(self.recurrent_state.uop.after(*stores)).float()                  # (B,H,D,D)
+    core_list[-1] = (post_state @ q[:, -1]).squeeze(-1)                                   # (B,H,D)
+    core_attn_in = Tensor.stack(*core_list, dim=1)                                        # (B,T,H,D)
+
+    core_attn_out = self.ssm_norm(core_attn_in)
+    return self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, T, -1).cast(x.dtype))
+
   # recurrent state can't be partially reused after divergence, force a full rebuild
   def _state_reset_ops(self):
     return [self.conv_state.assign(self.conv_state.const_like(0)),
@@ -301,6 +378,44 @@ class GatedDeltaNetBlock(FFNBlock):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
+      # Per-position state history for MTP speculative-decoding rollback. Stored as T separate
+      # (B,H,D,D)/(B,K-1,C) buffers (NOT a stacked (B,T,...,...) tensor) so every kernel touching
+      # them stays in the same 4D/3D shape signatures the baseline T=1 path uses.
+      self.rs_history:list[Tensor]|None = None
+      self.cs_history:list[Tensor]|None = None
+
+  def _alloc_history(self, T:int):
+    if self.rs_history is None or len(self.rs_history) != T:
+      self.rs_history = [Tensor.zeros_like(self.recurrent_state).cast('float32').contiguous().realize() for _ in range(T)]
+      self.cs_history = [Tensor.zeros_like(self.conv_state).contiguous().realize() for _ in range(T)]
+
+  def restore_to_position(self, j:int) -> list[Tensor]:
+    """Restore recurrent_state and conv_state to verify position j (state after processing j+1 verify inputs)."""
+    return [
+      self.recurrent_state.assign(self.rs_history[j].cast(self.recurrent_state.dtype)),
+      self.conv_state.assign(self.cs_history[j]),
+    ]
+
+class MTPHead:
+  """Qwen/DeepSeek-style Multi-Token Prediction head.
+
+  Takes the previous-step hidden state `h_prev` and the embedding of the just-sampled
+  next token `tok_embed` (both (B,1,D)), fuses them via eh_proj([hnorm(h_prev), enorm(tok_embed)]),
+  then runs a single transformer block. Returns the new hidden state (B,1,D).
+
+  The shared output_norm + lm_head from the main Transformer are reused for sampling
+  rather than duplicated; any dedicated `shared_head.*` weights in the GGUF are ignored.
+  """
+  def __init__(self, config:TransformerConfig):
+    self.config = config
+    self.enorm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.hnorm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.eh_proj = nn.Linear(2 * config.dim, config.dim, bias=False)
+    self.block = TransformerBlock(config)
+
+  def __call__(self, h_prev:Tensor, tok_embed:Tensor, start_pos:int|UOp) -> Tensor:
+    fused = self.eh_proj(self.hnorm(h_prev).cat(self.enorm(tok_embed), dim=-1))
+    return self.block(fused, start_pos)
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -315,20 +430,70 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
+    # MTP heads (dense Qwen/DeepSeek-style next-token-prediction heads, run after the main stack)
+    dense_mtp_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0,
+                               hidden_dim=config.dense_hidden_dim or config.hidden_dim, ssm=None)
+    self.mtp_heads:list[MTPHead] = [MTPHead(dense_mtp_config) for _ in range(config.num_mtp_heads)]
+    # side-effect buffer holding the latest MTP-chain hidden state; allocated lazily on first MTP call
+    # so it lives on the same device as the input. Float32 to match _body's output dtype.
+    self._mtp_h_buf:Tensor|None = None
+    # per-position hidden state from verify pass (shape (1, K+1, D)); used to refresh _mtp_h_buf
+    # at any accepted verify position without an extra main forward.
+    self._verify_h_buf:Tensor|None = None
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    # extra JITs for MTP path
+    self.mtp_main_jit = TinyJit(self._forward_with_hidden)        # main step, hidden written to self._mtp_h_buf
+    self.mtp_draft_jits = [TinyJit(self._make_mtp_step(i)) for i in range(len(self.mtp_heads))]
+    self.mtp_verify_jit = TinyJit(self._verify_forward)           # verify step: T=k, returns per-pos samples
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def _body(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
-    x = self.output_norm(x)
+    return x  # pre-output-norm hidden state
+
+  def _gumbel_argmax(self, logits:Tensor, temperature:Tensor) -> Tensor:
+    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) ~ sample from softmax(logits/temp)
+    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    x = self.output_norm(self._body(tokens, start_pos))
     if getenv("CUSTOM_VOCAB_ARGMAX") and x.device == "AMD" and x.shape[0] == 1 and x.shape[-1] == 1024 and self.output.weight.shape[0] == 248320:
       from tinygrad.llm.amd_kernels import q8_lmhead_gumbel_argmax
       return q8_lmhead_gumbel_argmax(x[:, -1, :], self.output.weight, temperature)
-    logits = self.output(x)[:, -1, :]
-    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return self._gumbel_argmax(self.output(x)[:, -1, :], temperature)
+
+  def _forward_with_hidden(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    """Main-model step that writes the last-position pre-norm hidden into self._mtp_h_buf
+    (single owned buffer) and returns the sampled token. The .assign() side-effect mirrors
+    nn.Optimizer's pattern so the tensor binding doesn't leak across JIT invocations."""
+    h = self._body(tokens, start_pos)                                       # (B, T, D)
+    last_h = h[:, -1:, :].contiguous()                                      # (B, 1, D)
+    self._mtp_h_buf.assign(last_h.cast(self._mtp_h_buf.dtype))
+    return self._gumbel_argmax(self.output(self.output_norm(h))[:, -1, :], temperature)
+
+  def _verify_forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    """Run main model over T tokens, returning per-position samples (B, T, 1). Also writes the
+    per-position pre-norm hidden state to self._verify_h_buf so generate_mtp can seed _mtp_h_buf
+    at whichever verify position the accept rolls back to."""
+    h = self._body(tokens, start_pos)                                                     # (B, T, D)
+    h_store = self._verify_h_buf.uop.store(h.cast(self._verify_h_buf.dtype).uop)
+    # Read post-store hidden and use it for the lm_head — guarantees the store side-effect fires.
+    h_post = Tensor(self._verify_h_buf.uop.after(h_store)).cast(h.dtype)
+    return self._gumbel_argmax(self.output(self.output_norm(h_post)), temperature)
+
+  def _make_mtp_step(self, head_idx:int):
+    """Returns a jit-friendly closure that runs one step of MTP head `head_idx`.
+    Writes the new hidden into self._mtp_h_buf (single owned buffer) as a side effect,
+    and returns only the sampled token. This avoids leaking per-call variable bindings
+    through a tuple-returned hidden tensor between JIT invocations."""
+    def _step(head_h_prev:Tensor, tok:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+      tok_embed = self.token_embd(tok).float()
+      h = self.mtp_heads[head_idx](head_h_prev, tok_embed, start_pos)       # (1, 1, D)
+      self._mtp_h_buf.assign(h.cast(self._mtp_h_buf.dtype))
+      return self._gumbel_argmax(self.output(self.output_norm(h))[:, -1, :], temperature)
+    return _step
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
@@ -358,6 +523,29 @@ class Transformer:
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
+
+    # Remap MTP (Multi-Token Prediction / nextn) block tensors. The trailing `nextn` blocks carry
+    # MTP-specific tensors under a `nextn.` infix alongside a standard transformer block.
+    # Observed layout (Qwen3.6 MTP): blk.{i}.nextn.{enorm,hnorm,eh_proj,shared_head_norm}.weight + blk.{i}.{attn_*, ffn_*, *_norm}.
+    nextn = kv.get(f'{arch}.nextn_predict_layers', 0)
+    if nextn:
+      main_blocks = kv[f'{arch}.block_count'] - nextn
+      for name in list(state_dict.keys()):
+        m = re.match(r'blk\.(\d+)\.(.*)', name)
+        if not m: continue
+        bi = int(m.group(1))
+        if bi < main_blocks: continue
+        head_idx, rest = bi - main_blocks, m.group(2)
+        if rest in ('nextn.enorm.weight', 'nextn.hnorm.weight', 'nextn.eh_proj.weight'):
+          state_dict[f'mtp_heads.{head_idx}.{rest.split(".",1)[1]}'] = state_dict.pop(name)
+        elif rest in ('nextn.shared_head_norm.weight', 'nextn.shared_head.norm.weight',
+                      'nextn.shared_head.head.weight', 'nextn.embed_tokens.weight',
+                      'embed_tokens.weight', 'shared_head.norm.weight', 'shared_head.head.weight'):
+          # tied to main token_embd / output_norm / output — drop the dedicated copy
+          del state_dict[name]
+        else:
+          # standard transformer-block weights live under .block.*
+          state_dict[f'mtp_heads.{head_idx}.block.{rest}'] = state_dict.pop(name)
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
@@ -393,7 +581,8 @@ class Transformer:
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
+      num_mtp_heads=kv.get(f'{arch}.nextn_predict_layers', 0))
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
@@ -405,6 +594,126 @@ class Transformer:
   def get_start_pos(self, tokens:list[int]) -> int:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
+
+  def generate_mtp(self, tokens:list[int], k:int=2, chunk_size:int=32, temperature:float=0.0):
+    """Speculative decoding using the MTP heads to draft k tokens per main-model step.
+
+    Single-batch only. On accept-length j (0 <= j <= k), this iteration commits j+1 tokens via
+    one verify forward (T=K+1) plus k MTP-draft forwards. SSM state is rolled back in O(1)
+    via per-position history saved during the verify pass. KV cache rollback is implicit —
+    next iteration's writes overwrite stale slots.
+
+    NOTE: Correctness has been verified, but current performance is worse than baseline non-MTP
+    decoding on hybrid SSM/attention models. The verify forward (T>1) generates new kernel
+    shapes that tinygrad's JIT scheduler hasn't tuned as well as the well-trodden T=1 path.
+    Closing the gap is a kernel-layer task, not a Python-level one.
+    """
+    assert self.mtp_heads, "model has no MTP heads loaded"
+    assert k >= 1
+    # GatedDeltaNet._attention_tn Python-iterates conv windows, so its T must be a concrete
+    # int at JIT-trace time. Verify is fixed at T=k+1; restrict prefill chunks to T=1 so
+    # symbolic chunk sizes never reach _attention_tn.
+    if self.has_recurrent_block: chunk_size = 1
+    v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
+    v_toks = UOp.variable("toks", 1, chunk_size)
+    v_mtp_sp = UOp.variable("mtp_sp", 0, self.max_context-1)
+    temp = Tensor(temperature).contiguous()
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+
+    # allocate (or reallocate if device or k changed) the MTP buffers
+    dim = self.blk[0].config.dim
+    verify_T = k + 1  # verify processes [last_committed, drafts[0..k-1]] in one batched forward
+    if self._mtp_h_buf is None or self._mtp_h_buf.device != t.device:
+      self._mtp_h_buf = Tensor.zeros(1, 1, dim, device=t.device, dtype='float32').contiguous().realize()
+    if self._verify_h_buf is None or self._verify_h_buf.device != t.device or self._verify_h_buf.shape[1] != verify_T:
+      self._verify_h_buf = Tensor.zeros(1, verify_T, dim, device=t.device, dtype='float32').contiguous().realize()
+
+    # ----- prefill (chunked) using the standard path; ensures main KV is populated -----
+    start_pos = self.get_start_pos(tokens)
+    if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
+    prompt_len = len(tokens)
+    out_main = None
+    while start_pos < prompt_len:
+      nt = min(chunk_size, prompt_len - start_pos)
+      sp, ntb = v_start_pos.bind(start_pos), v_toks.bind(nt)
+      # last prefill chunk: use _forward_with_hidden so we can seed MTP. Earlier chunks: standard forward.
+      if start_pos + nt == prompt_len:
+        out_main = self.mtp_main_jit(t[:, sp:sp+ntb].contiguous(), sp, temp).realize()
+      else:
+        out_main = self(t[:, sp:sp+ntb], sp, temp).realize()
+      start_pos += nt
+
+    # commit the first sampled token (from the last prefill chunk)
+    tokens.append(int(out_main.item()))
+    self._cached_tokens = tokens[:-1]
+    yield tokens[-1]
+    # main KV reflects positions [0, prompt_len). start_pos == prompt_len.
+    # self._mtp_h_buf holds the hidden at position prompt_len-1 used to predict tokens[-1].
+
+    # Now that all SSM blocks have called _init_state during prefill, allocate per-position history buffers.
+    for blk in self.blk:
+      if isinstance(blk, GatedDeltaNetBlock): blk._alloc_history(verify_T)
+
+    mtp_start_pos = 0  # MTP heads have their own cache; we maintain their pointer separately
+    last_committed = tokens[-1]
+    # head_h is a stable view of the side-effect buffer; the JIT writes into it each step.
+    head_h_view = self._mtp_h_buf
+    # buffer tensors are allocated once on first use; verify input width is fixed at K+1
+    verify_buf = Tensor.zeros(1, verify_T, dtype="int32").contiguous()
+    tok_buf = Tensor.zeros(1, 1, dtype="int32").contiguous()
+
+    while len(tokens) < self.max_context:
+      # ----- draft k tokens with the MTP heads -----
+      drafts:list[int] = []
+      cur_tok = last_committed
+      for i in range(k):
+        head = i % len(self.mtp_heads)
+        tok_buf.assign(Tensor([[cur_tok]], dtype="int32")).realize()
+        sp_m = v_mtp_sp.bind(mtp_start_pos + i)
+        # head_h_view aliases self._mtp_h_buf; each call reads its prior value and overwrites it.
+        sample = self.mtp_draft_jits[head](head_h_view, tok_buf, sp_m, temp)
+        cur_tok = int(sample.item())
+        drafts.append(cur_tok)
+
+      # ----- verify: T=K+1 forward over [last_committed, drafts[0..K-1]] in one main pass -----
+      # SSM blocks save per-position state to rs_history/cs_history during this forward so we
+      # can roll back to any accept position in O(1) (no sequential re-advance forwards needed).
+      ssm_blocks = [blk for blk in self.blk if isinstance(blk, GatedDeltaNetBlock)]
+      verify_input = [last_committed] + drafts
+      verify_buf.assign(Tensor([verify_input], dtype="int32")).realize()
+      sp = v_start_pos.bind(start_pos)
+      samples = self.mtp_verify_jit(verify_buf, sp, temp).realize()  # (1, K+1, 1)
+      pred = [int(samples[0, i, 0].item()) for i in range(verify_T)]
+      # pred[i] is main's prediction at verify position i = token that should follow verify_input[i].
+      # Compare pred[0..K-1] against drafts[0..K-1]. pred[K] is the bonus if all accepted.
+      # pred[0] is main's "what comes after last_committed" -> compare with drafts[0]
+      # pred[i] is main's "what comes after drafts[i-1]"     -> compare with drafts[i]   (for i>=1)
+      # ...except pred[k-1] which has no draft to compare to: it's a free bonus token if all earlier accepted.
+
+      # find longest accepted prefix among drafts[0..K-1]
+      accept = 0
+      while accept < k and pred[accept] == drafts[accept]:
+        accept += 1
+      # Committed sequence: drafts[0..accept-1] + pred[accept]. j+1 tokens. (When accept==K, pred[K] is bonus.)
+      new_tokens = drafts[:accept] + [pred[accept]]
+
+      # Roll back SSM state to verify position `accept` (state after processing verify input[accept]).
+      # KV cache rollback is implicit (positional writes; next iter overwrites stale slots).
+      if ssm_blocks and accept < k:
+        Tensor.realize(*[t for blk in ssm_blocks for t in blk.restore_to_position(accept)])
+      # Seed _mtp_h_buf from verify's per-position hidden at the accepted position. This is what the
+      # next MTP draft chain will read.
+      self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :]).realize()
+
+      start_pos += accept + 1
+      mtp_start_pos += accept
+      last_committed = new_tokens[-1]
+
+      for nt in new_tokens:
+        tokens.append(nt)
+        self._cached_tokens = tokens[:-1]
+        yield nt
+        if len(tokens) >= self.max_context: return
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block: chunk_size = 1
