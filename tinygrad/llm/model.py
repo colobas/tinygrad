@@ -374,9 +374,9 @@ class GatedDeltaNetBlock(FFNBlock):
     conv_state_store     = self.conv_state.uop.store(final_conv.cast(self.conv_state.dtype).uop)
     stores = [recurrent_state_store, conv_state_store]
     if self.rs_history is not None:
-      for t, S_t in enumerate(S_list):
-        stores.append(self.rs_history[t].uop.store(S_t.cast(self.rs_history[t].dtype).uop))
-      for t in range(T):
+      # Only positions [0, len(rs_history)-1] are ever restored — full-accept skips restore in generate_mtp.
+      for t in range(len(self.rs_history)):
+        stores.append(self.rs_history[t].uop.store(S_list[t].cast(self.rs_history[t].dtype).uop))
         slice_t = conv_window[:, t+1:t+self.ssm_conv_kernel, :]
         stores.append(self.cs_history[t].uop.store(slice_t.cast(self.cs_history[t].dtype).uop))
     # Read final_S back via .after(stores) and use it for the last position's output, threading
@@ -682,7 +682,8 @@ class Transformer:
 
     # Now that all SSM blocks have called _init_state during prefill, allocate per-position history buffers.
     for blk in self.blk:
-      if isinstance(blk, GatedDeltaNetBlock): blk._alloc_history(verify_T)
+      # Only positions [0, K-1] are ever restored (full accept skips restore); skip writing position K.
+      if isinstance(blk, GatedDeltaNetBlock): blk._alloc_history(verify_T - 1)
 
     # MTP heads share absolute RoPE position with the main sequence — initialize to the post-prefill position
     # and advance by the number of committed tokens each iter (accept drafts + 1 verify-bonus).
@@ -750,11 +751,11 @@ class Transformer:
 
       # Roll back SSM state to verify position `accept` (state after processing verify input[accept]).
       # KV cache rollback is implicit (positional writes; next iter overwrites stale slots).
+      # Batch SSM rollback (on partial accept) + _mtp_h_buf seed into a single realize/sync.
+      post_ops = [self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :])]
       if ssm_blocks and accept < k:
-        Tensor.realize(*[t for blk in ssm_blocks for t in blk.restore_to_position(accept)])
-      # Seed _mtp_h_buf from verify's per-position hidden at the accepted position. This is what the
-      # next MTP draft chain will read.
-      self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :]).realize()
+        post_ops.extend(t for blk in ssm_blocks for t in blk.restore_to_position(accept))
+      Tensor.realize(*post_ops)
 
       start_pos += accept + 1
       mtp_start_pos += accept + 1
