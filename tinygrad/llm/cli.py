@@ -321,6 +321,7 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--prompt", type=str, default=None, help="Benchmark prompt (default: BOS only)")
   parser.add_argument("--mtp", type=int, default=0, metavar="K",
                       help="Speculative decoding via MTP heads, drafting K tokens per main step (requires an MTP-enabled GGUF). "
                            "NOTE: currently slower than baseline on hybrid SSM models — needs kernel-layer tuning to deliver speedup.")
@@ -359,7 +360,8 @@ def main():
 
   # do benchmark
   if args.benchmark is not None:
-    gen = (model.generate_mtp(toks:=[tok.bos_id or 0], k=args.mtp) if args.mtp else model.generate(toks:=[tok.bos_id or 0]))
+    toks = (tok.prefix() + tok.encode(args.prompt)) if args.prompt else [tok.bos_id or 0]
+    gen = (model.generate_mtp(toks, k=args.mtp) if args.mtp else model.generate(toks))
     for i in range(args.benchmark):
       profile_marker(f"decode @ {i}")
       GlobalCounters.reset()

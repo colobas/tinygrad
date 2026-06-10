@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, itertools, pathlib, re
+import functools, itertools, pathlib, re, time, collections
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
@@ -204,8 +204,9 @@ class TransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      # TODO: how is the dtype of this determined?
-      self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
+      # zeros (not empty): MTP head blocks are never prefilled, so they read at positions that were
+      # never written; uninitialized memory there leaks NaN. Main blocks always overwrite before read.
+      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device).contiguous().realize()
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
@@ -693,8 +694,18 @@ class Transformer:
     verify_buf = Tensor.zeros(1, verify_T, dtype="int32").contiguous()
     tok_buf = Tensor.zeros(1, 1, dtype="int32").contiguous()
 
+    prof = getenv("MTP_PROF", 0)
+    dbg_n = getenv("MTP_DEBUG", 0)
+    dbg_i = 0
+    prof_accept_hist:collections.Counter = collections.Counter()
+    prof_sums = {"draft": 0.0, "verify": 0.0, "rollback_seed": 0.0, "iters": 0, "committed": 0}
+    def _sync():
+      if prof: Tensor([0], device=t.device).realize()
+
     while len(tokens) < self.max_context:
       # ----- draft k tokens with the MTP heads -----
+      _sync()
+      t_draft = time.perf_counter() if prof else 0.0
       drafts:list[int] = []
       cur_tok = last_committed
       for i in range(k):
@@ -705,6 +716,8 @@ class Transformer:
         sample = self.mtp_draft_jits[head](head_h_view, tok_buf, sp_m, temp)
         cur_tok = int(sample.item())
         drafts.append(cur_tok)
+      _sync()
+      t_verify = time.perf_counter() if prof else 0.0
 
       # ----- verify: T=K+1 forward over [last_committed, drafts[0..K-1]] in one main pass -----
       # SSM blocks save per-position state to rs_history/cs_history during this forward so we
@@ -715,6 +728,8 @@ class Transformer:
       sp = v_start_pos.bind(start_pos)
       samples = self.mtp_verify_jit(verify_buf, sp, temp).realize()  # (1, K+1, 1)
       pred = [int(samples[0, i, 0].item()) for i in range(verify_T)]
+      _sync()
+      t_rollback = time.perf_counter() if prof else 0.0
       # pred[i] is main's prediction at verify position i = token that should follow verify_input[i].
       # Compare pred[0..K-1] against drafts[0..K-1]. pred[K] is the bonus if all accepted.
       # pred[0] is main's "what comes after last_committed" -> compare with drafts[0]
@@ -725,6 +740,11 @@ class Transformer:
       accept = 0
       while accept < k and pred[accept] == drafts[accept]:
         accept += 1
+
+      if dbg_i < dbg_n:
+        dbg_i += 1
+        print(f"[mtp-dbg iter={dbg_i}] last_committed={last_committed} drafts={drafts} pred={pred} "
+              f"accept={accept} mtp_start_pos={mtp_start_pos} start_pos={start_pos}", flush=True)
       # Committed sequence: drafts[0..accept-1] + pred[accept]. j+1 tokens. (When accept==K, pred[K] is bonus.)
       new_tokens = drafts[:accept] + [pred[accept]]
 
@@ -739,6 +759,23 @@ class Transformer:
       start_pos += accept + 1
       mtp_start_pos += accept + 1
       last_committed = new_tokens[-1]
+
+      if prof:
+        _sync()
+        t_end = time.perf_counter()
+        prof_sums["draft"] += (t_verify - t_draft) * 1000
+        prof_sums["verify"] += (t_rollback - t_verify) * 1000
+        prof_sums["rollback_seed"] += (t_end - t_rollback) * 1000
+        prof_sums["iters"] += 1
+        prof_sums["committed"] += len(new_tokens)
+        prof_accept_hist[accept] += 1
+        if prof_sums["iters"] % prof == 0:
+          n = prof_sums["iters"]
+          hist = " ".join(f"{a}:{prof_accept_hist[a]}" for a in range(k+1))
+          mean_accept = sum(a*c for a,c in prof_accept_hist.items()) / n
+          print(f"[mtp-prof] iters={n} K={k} draft={prof_sums['draft']/n:.1f}ms verify={prof_sums['verify']/n:.1f}ms "
+                f"rollback+seed={prof_sums['rollback_seed']/n:.1f}ms accept_mean={mean_accept:.2f} "
+                f"tok/iter={prof_sums['committed']/n:.2f} hist[{hist}]", flush=True)
 
       for nt in new_tokens:
         tokens.append(nt)
