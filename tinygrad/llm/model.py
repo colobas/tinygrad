@@ -711,7 +711,8 @@ class Transformer:
       cur_tok = last_committed
       for i in range(k):
         head = i % len(self.mtp_heads)
-        tok_buf.assign(Tensor([[cur_tok]], dtype="int32")).realize()
+        # No explicit .realize() needed — the draft JIT realizes tok_buf when binding it as input.
+        tok_buf.assign(Tensor([[cur_tok]], dtype="int32"))
         sp_m = v_mtp_sp.bind(mtp_start_pos + i)
         # head_h_view aliases self._mtp_h_buf; each call reads its prior value and overwrites it.
         sample = self.mtp_draft_jits[head](head_h_view, tok_buf, sp_m, temp)
@@ -725,10 +726,12 @@ class Transformer:
       # can roll back to any accept position in O(1) (no sequential re-advance forwards needed).
       ssm_blocks = [blk for blk in self.blk if isinstance(blk, GatedDeltaNetBlock)]
       verify_input = [last_committed] + drafts
-      verify_buf.assign(Tensor([verify_input], dtype="int32")).realize()
+      verify_buf.assign(Tensor([verify_input], dtype="int32"))
       sp = v_start_pos.bind(start_pos)
       samples = self.mtp_verify_jit(verify_buf, sp, temp).realize()  # (1, K+1, 1)
-      pred = [int(samples[0, i, 0].item()) for i in range(verify_T)]
+      # One host sync via .tolist() instead of verify_T separate .item() calls — each .item() on a
+      # sliced view forces a fresh host-device sync (~44 ms on AMD).
+      pred = samples.reshape(verify_T).tolist()
       _sync()
       t_rollback = time.perf_counter() if prof else 0.0
       # pred[i] is main's prediction at verify position i = token that should follow verify_input[i].
