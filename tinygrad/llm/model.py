@@ -691,9 +691,15 @@ class Transformer:
     last_committed = tokens[-1]
     # head_h is a stable view of the side-effect buffer; the JIT writes into it each step.
     head_h_view = self._mtp_h_buf
-    # buffer tensors are allocated once on first use; verify input width is fixed at K+1
-    verify_buf = Tensor.zeros(1, verify_T, dtype="int32").contiguous()
-    tok_buf = Tensor.zeros(1, 1, dtype="int32").contiguous()
+    # buffer tensors are allocated once on first use; verify input width is fixed at K+1.
+    # Realize up-front so their UOps are bare BUFFER (no pending assigns) — lets the JIT trace
+    # capture the underlying buffer once and lets us mutate contents via raw copyin per iter
+    # (skipping the ~30 ms/iter cost of constructing `Tensor([[cur_tok]], dtype=...)`).
+    verify_buf = Tensor.zeros(1, verify_T, dtype="int32").contiguous().realize()
+    tok_buf = Tensor.zeros(1, 1, dtype="int32").contiguous().realize()
+    import array
+    tok_stage = array.array('i', [0])
+    verify_stage = array.array('i', [0] * verify_T)
 
     prof = getenv("MTP_PROF", 0)
     dbg_n = getenv("MTP_DEBUG", 0)
@@ -711,8 +717,11 @@ class Transformer:
       cur_tok = last_committed
       for i in range(k):
         head = i % len(self.mtp_heads)
-        # No explicit .realize() needed — the draft JIT realizes tok_buf when binding it as input.
-        tok_buf.assign(Tensor([[cur_tok]], dtype="int32"))
+        # Raw copyin into tok_buf's device buffer — skips Tensor([[cur_tok]]) construction (~30 ms).
+        # tok_buf's UOp is a bare BUFFER (no pending assigns), so the JIT trace captures the slot once
+        # and replay reads the current bytes; no UOp invalidation needed.
+        tok_stage[0] = cur_tok
+        tok_buf.uop.buffer.copyin(memoryview(tok_stage))
         sp_m = v_mtp_sp.bind(mtp_start_pos + i)
         # head_h_view aliases self._mtp_h_buf; each call reads its prior value and overwrites it.
         sample = self.mtp_draft_jits[head](head_h_view, tok_buf, sp_m, temp)
@@ -725,8 +734,9 @@ class Transformer:
       # SSM blocks save per-position state to rs_history/cs_history during this forward so we
       # can roll back to any accept position in O(1) (no sequential re-advance forwards needed).
       ssm_blocks = [blk for blk in self.blk if isinstance(blk, GatedDeltaNetBlock)]
-      verify_input = [last_committed] + drafts
-      verify_buf.assign(Tensor([verify_input], dtype="int32"))
+      verify_stage[0] = last_committed
+      for i, d in enumerate(drafts): verify_stage[i+1] = d
+      verify_buf.uop.buffer.copyin(memoryview(verify_stage))
       sp = v_start_pos.bind(start_pos)
       samples = self.mtp_verify_jit(verify_buf, sp, temp).realize()  # (1, K+1, 1)
       # One host sync via .tolist() instead of verify_T separate .item() calls — each .item() on a
