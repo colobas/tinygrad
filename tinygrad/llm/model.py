@@ -504,6 +504,10 @@ class Transformer:
     # extra JITs for MTP path
     self.mtp_main_jit = TinyJit(self._forward_with_hidden)        # main step, hidden written to self._mtp_h_buf
     self.mtp_draft_jits = [TinyJit(self._make_mtp_step(i)) for i in range(len(self.mtp_heads))]
+    # first draft of each iter reads h_prev from self._verify_h_buf[seed_accept] (a bound UOp.variable)
+    # instead of self._mtp_h_buf, so the per-iter seed copy+realize (and its per-accept static-slice
+    # kernels) is eliminated — the seed read fuses into the draft forward. See generate_mtp.
+    self.mtp_first_draft_jit = TinyJit(self._make_mtp_first_step(0)) if self.mtp_heads else None
     self.mtp_verify_jit = TinyJit(self._verify_forward)           # verify step: T=k, returns per-pos samples
 
   def _body(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
@@ -557,6 +561,20 @@ class Transformer:
       h = self.mtp_heads[head_idx](head_h_prev, tok_embed, start_pos)       # (1, 1, D)
       self._mtp_h_buf.assign(h.cast(self._mtp_h_buf.dtype))
       # MTP-specific final norm (not main output_norm); shares lm_head with main.
+      return self._gumbel_argmax(self.output(self.mtp_heads[head_idx].shared_head_norm(h))[:, -1, :], temperature)
+    return _step
+
+  def _make_mtp_first_step(self, head_idx:int):
+    """Like _make_mtp_step but reads h_prev from self._verify_h_buf[seed_accept] (bound UOp.variable)
+    rather than self._mtp_h_buf. The previous iter's verify wrote per-position hiddens into
+    _verify_h_buf; seed_accept selects the accepted position. This fuses the _mtp_h_buf seed into the
+    first draft's forward — no per-iter assign+realize, and one symbolic-indexed kernel instead of a
+    distinct static-slice kernel per accept value. Still writes _mtp_h_buf so later drafts chain off it."""
+    def _step(verify_h_buf:Tensor, seed_accept:UOp, tok:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+      head_h_prev = verify_h_buf[:, seed_accept:seed_accept+1, :]           # (1, 1, D), symbolic slot
+      tok_embed = self.token_embd(tok).float()
+      h = self.mtp_heads[head_idx](head_h_prev, tok_embed, start_pos)       # (1, 1, D)
+      self._mtp_h_buf.assign(h.cast(self._mtp_h_buf.dtype))
       return self._gumbel_argmax(self.output(self.mtp_heads[head_idx].shared_head_norm(h))[:, -1, :], temperature)
     return _step
 
@@ -738,6 +756,12 @@ class Transformer:
     last_committed = tokens[-1]
     # head_h is a stable view of the side-effect buffer; the JIT writes into it each step.
     head_h_view = self._mtp_h_buf
+    # First draft reads h_prev from _verify_h_buf[seed_accept] (bound below). Seed slot K from the
+    # prefill hidden and start seed_accept=K so iter-1's draft 0 reads the prefill seed; thereafter
+    # each verify overwrites _verify_h_buf[0..K] and seed_accept tracks the accepted position.
+    v_seed_accept = UOp.variable("seed_accept", 0, k)
+    Tensor.realize(self._verify_h_buf[:, k:k+1, :].assign(self._mtp_h_buf))
+    seed_accept = k
     # buffer tensors are allocated once on first use; verify input width is fixed at K+1.
     # Realize up-front so their UOps are bare BUFFER (no pending assigns) — lets the JIT trace
     # capture the underlying buffer once and lets us mutate contents via raw copyin per iter
@@ -774,8 +798,12 @@ class Transformer:
         tok_stage[0] = cur_tok
         tok_buf.uop.buffer.copyin(memoryview(tok_stage))
         sp_m = v_mtp_sp.bind(mtp_start_pos + i)
-        # head_h_view aliases self._mtp_h_buf; each call reads its prior value and overwrites it.
-        sample = self.mtp_draft_jits[head](head_h_view, tok_buf, sp_m, temp)
+        if i == 0:
+          # draft 0 reads h_prev from _verify_h_buf[seed_accept] directly (fuses the seed in, no realize)
+          sample = self.mtp_first_draft_jit(self._verify_h_buf, v_seed_accept.bind(seed_accept), tok_buf, sp_m, temp)
+        else:
+          # head_h_view aliases self._mtp_h_buf; each call reads its prior value (draft 0's hidden) and overwrites it.
+          sample = self.mtp_draft_jits[head](head_h_view, tok_buf, sp_m, temp)
         cur_tok = int(sample.item())
         drafts.append(cur_tok)
       _sync()
@@ -814,11 +842,11 @@ class Transformer:
       # Committed sequence: drafts[0..accept-1] + pred[accept]. j+1 tokens. (When accept==K, pred[K] is bonus.)
       new_tokens = drafts[:accept] + [pred[accept]]
 
-      # SSM rollback is now free: next iter binds mtp_accept=accept and the verify body reads
-      # rs_stack[accept] / cs_stack[accept] directly as its starting state. Only seed _mtp_h_buf
-      # from the verify hidden slice — that sync is the irreducible verify-GPU-completion wait.
-      Tensor.realize(self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :]))
+      # SSM rollback is free: next iter binds mtp_accept=accept and the verify body reads
+      # rs_stack[accept] / cs_stack[accept] directly as its starting state. The _mtp_h_buf seed is
+      # also free now: next iter's first draft reads _verify_h_buf[seed_accept] directly (no copy).
       prev_accept = accept
+      seed_accept = accept
 
       start_pos += accept + 1
       mtp_start_pos += accept + 1
