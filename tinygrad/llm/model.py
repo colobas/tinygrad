@@ -141,6 +141,20 @@ class FFNBlock:
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
+    if resolve(x.shape[1] != 1):
+      # T>1 (MTP verify): hoist attn_norm/ffn_norm out of the @function precompile barrier so the
+      # attn_q/attn_output/ffn_* matmuls compile without the per-row RMSnorm reduction pinning BEAM
+      # to per-T-row dispatch. +15% real on the verify path (was Update 9's gated MTP_SPLIT_NORM).
+      x_normed = self.attn_norm(x).contiguous()
+      @function(precompile=True, allow_implicit=True)
+      def _run_attn(x:Tensor, x_normed:Tensor, start_pos:int|UOp):
+        return x + self._attention(x_normed, start_pos)
+      h = _run_attn(x, x_normed, start_pos)
+      h_normed = self.ffn_norm(h).contiguous()
+      @function(precompile=True, allow_implicit=True)
+      def _run_ffn(h:Tensor, h_normed:Tensor):
+        return (h + self._feed_forward(h_normed)).contiguous()
+      return _run_ffn(h, h_normed)
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
       h =     x + self._attention(self.attn_norm(x), start_pos)
@@ -315,8 +329,10 @@ class GatedDeltaNetBlock(FFNBlock):
     all T inputs (bandwidth amortized). The DeltaNet recurrence itself
       `S_t = S_{t-1} * alpha_t + (v_t - S_{t-1} @ k_t) * beta_t @ k_t^T`
     is unrolled sequentially in-graph over T to keep every kernel in the same `(B,H,D,D)`
-    shape signature as the baseline T=1 path. Per-position state is saved to `rs_history`
-    / `cs_history` so generate_mtp can roll back in O(1) on partial accept.
+    shape signature as the baseline T=1 path. Per-position state is saved to `rs_stack[0..T-1]`
+    / `cs_stack[0..T-1]` (stacked, shape (T, ...)). On the NEXT iter's verify, the starting
+    state is read from `rs_stack[mtp_accept]` via a bound `UOp.variable` so partial-accept
+    rollback is free — no explicit SSM restore between iters.
 
     NOTE: An earlier version used a Hillis-Steele parallel scan, but the resulting
     `(B,T,H,D,D)` 5D-tensor kernels compiled to suboptimal schedules. The sequential-in-graph
@@ -339,8 +355,19 @@ class GatedDeltaNetBlock(FFNBlock):
     beta  = self.ssm_beta(x_flat).sigmoid().reshape(B, T, H).float()                     # (B,T,H)
     alpha = ((self.ssm_alpha(x_flat).float() + self.ssm_dt["bias"]).softplus() * self.ssm_a).reshape(B, T, H).exp()  # (B,T,H)
 
+    # --- starting state: read from rs_stack[mtp_accept] (Variable-indexed) when MTP is active.
+    # First verify of the run seeds rs_stack[T-1] from recurrent_state (see Transformer.generate_mtp)
+    # and binds mtp_accept = T-1, so this path also covers the cold case.
+    mtp_accept = getattr(self, '_mtp_accept_uop', None)
+    if mtp_accept is not None and self.rs_stack is not None:
+      conv_start = self.cs_stack[mtp_accept:mtp_accept+1].reshape(*self.conv_state.shape)
+      S0 = self.rs_stack[mtp_accept:mtp_accept+1].reshape(*self.recurrent_state.shape).float()
+    else:
+      conv_start = self.conv_state
+      S0 = self.recurrent_state.float()                                                    # (B,H,D,D)
+
     # --- depthwise conv over the (K-1 prior + T new) qkv window, producing T outputs ---
-    conv_window = self.conv_state.cat(self.attn_qkv(x_flat).reshape(B, T, -1), dim=1)    # (B, K-1+T, C)
+    conv_window = conv_start.cat(self.attn_qkv(x_flat).reshape(B, T, -1), dim=1)         # (B, K-1+T, C)
     weight = self.ssm_conv1d["weight"].T.reshape(1, 1, K, -1)                             # (1,1,K,C)
     # Build T sliding windows of length K via Python-level stack (T is a concrete int at trace time).
     windows = Tensor.stack(*[conv_window[:, t:t+K, :] for t in range(T)], dim=1)          # (B,T,K,C)
@@ -355,7 +382,7 @@ class GatedDeltaNetBlock(FFNBlock):
     v = v.unsqueeze(-1).float()
 
     # --- recurrent SSM update: sequential-in-graph over T (see class docstring NOTE) ---
-    S = self.recurrent_state.float()                                                      # (B,H,D,D)
+    S = S0
     S_list:list[Tensor] = []
     core_list:list[Tensor] = []
     for t in range(T):
@@ -366,19 +393,19 @@ class GatedDeltaNetBlock(FFNBlock):
       S = S + ((v_t - S @ k_t) * beta_t) @ k_t.transpose(-1, -2)
       S_list.append(S)
       core_list.append((S @ q_t).squeeze(-1))                                             # (B,H,D)
-    # Persist current state (last position) AND per-position history for MTP rollback.
-    # Each store target stays in baseline-shape (no 5D (B,T,H,D,D) intermediates anywhere).
+    # Persist final state (used by non-MTP T=1 paths) AND ALL T per-position states into rs_stack /
+    # cs_stack (used by next iter's verify as the variable-indexed starting state).
     final_S = S_list[-1]                                                                  # (B,H,D,D)
     final_conv = conv_window[:, T:, :]                                                    # (B,K-1,C)
     recurrent_state_store = self.recurrent_state.uop.store(final_S.cast(self.recurrent_state.dtype).uop)
     conv_state_store     = self.conv_state.uop.store(final_conv.cast(self.conv_state.dtype).uop)
     stores = [recurrent_state_store, conv_state_store]
-    if self.rs_history is not None:
-      # Only positions [0, len(rs_history)-1] are ever restored — full-accept skips restore in generate_mtp.
-      for t in range(len(self.rs_history)):
-        stores.append(self.rs_history[t].uop.store(S_list[t].cast(self.rs_history[t].dtype).uop))
+    if self.rs_stack is not None:
+      # Store all T positions; accept = j picks rs_stack[j] as next iter's starting state, j ∈ [0, T-1].
+      for t in range(T):
+        stores.append(self.rs_stack[t].uop.store(S_list[t].cast(self.rs_stack.dtype).uop))
         slice_t = conv_window[:, t+1:t+self.ssm_conv_kernel, :]
-        stores.append(self.cs_history[t].uop.store(slice_t.cast(self.cs_history[t].dtype).uop))
+        stores.append(self.cs_stack[t].uop.store(slice_t.cast(self.cs_stack.dtype).uop))
     # Read final_S back via .after(stores) and use it for the last position's output, threading
     # the store side effects through the returned core_attn_in.
     post_state = Tensor(self.recurrent_state.uop.after(*stores)).float()                  # (B,H,D,D)
@@ -402,22 +429,26 @@ class GatedDeltaNetBlock(FFNBlock):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
-      # Per-position state history for MTP speculative-decoding rollback. Stored as T separate
-      # (B,H,D,D)/(B,K-1,C) buffers (NOT a stacked (B,T,...,...) tensor) so every kernel touching
-      # them stays in the same 4D/3D shape signatures the baseline T=1 path uses.
-      self.rs_history:list[Tensor]|None = None
-      self.cs_history:list[Tensor]|None = None
+      # Per-position state history (rs_stack[t], cs_stack[t] for t in 0..T-1, T = verify_T = K+1) used
+      # by MTP speculative decoding. Index `mtp_accept` via a bound UOp.variable so partial-accept
+      # rollback is free — the next iter's verify reads its starting state from rs_stack[accept]
+      # directly, no explicit restore copy between iters.
+      self.rs_stack:Tensor|None = None
+      self.cs_stack:Tensor|None = None
+      self._mtp_accept_uop:UOp|None = None
 
   def _alloc_history(self, T:int):
-    if self.rs_history is None or len(self.rs_history) != T:
-      self.rs_history = [Tensor.zeros_like(self.recurrent_state).cast('float32').contiguous().realize() for _ in range(T)]
-      self.cs_history = [Tensor.zeros_like(self.conv_state).contiguous().realize() for _ in range(T)]
+    # T = verify_T = K+1. rs_stack[0..T-1] / cs_stack[0..T-1] cover all accept ∈ [0, T-1].
+    if self.rs_stack is None or self.rs_stack.shape[0] != T:
+      self.rs_stack = Tensor.zeros(T, *self.recurrent_state.shape, dtype='float32', device=self.recurrent_state.device).contiguous().realize()
+      self.cs_stack = Tensor.zeros(T, *self.conv_state.shape, dtype=self.conv_state.dtype, device=self.conv_state.device).contiguous().realize()
 
-  def restore_to_position(self, j:int) -> list[Tensor]:
-    """Restore recurrent_state and conv_state to verify position j (state after processing j+1 verify inputs)."""
+  def _seed_history_from_state(self, j:int) -> list[Tensor]:
+    """Copy current recurrent_state / conv_state into rs_stack[j] / cs_stack[j] — used to seed the
+    first verify of a run (no prior verify to populate the stack)."""
     return [
-      self.recurrent_state.assign(self.rs_history[j].cast(self.recurrent_state.dtype)),
-      self.conv_state.assign(self.cs_history[j]),
+      self.rs_stack[j].assign(self.recurrent_state.cast(self.rs_stack.dtype)),
+      self.cs_stack[j].assign(self.conv_state.cast(self.cs_stack.dtype)),
     ]
 
 class MTPHead:
@@ -500,10 +531,16 @@ class Transformer:
     self._mtp_h_buf.assign(last_h.cast(self._mtp_h_buf.dtype))
     return self._gumbel_argmax(self.output(self.output_norm(h))[:, -1, :], temperature)
 
-  def _verify_forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def _verify_forward(self, tokens:Tensor, start_pos:int|UOp, mtp_accept:UOp, temperature:Tensor) -> Tensor:
     """Run main model over T tokens, returning per-position samples (B, T, 1). Also writes the
     per-position pre-norm hidden state to self._verify_h_buf so generate_mtp can seed _mtp_h_buf
-    at whichever verify position the accept rolls back to."""
+    at whichever verify position the accept rolls back to. `mtp_accept` is a bound UOp.variable
+    that SSM blocks consume (stashed below) to pick which rs_stack slot to read as the starting
+    recurrent state — eliminating explicit per-iter restore copies."""
+    # Plumb the BOUND mtp_accept to SSM blocks for this trace. Using the arg (not the closure-stored
+    # unbound variable) ensures the binding flows through the JIT's arg-time var_vals collection.
+    for blk in self.blk:
+      if isinstance(blk, GatedDeltaNetBlock): blk._mtp_accept_uop = mtp_accept
     h = self._body(tokens, start_pos)                                                     # (B, T, D)
     h_store = self._verify_h_buf.uop.store(h.cast(self._verify_h_buf.dtype).uop)
     # Read post-store hidden and use it for the lm_head — guarantees the store side-effect fires.
@@ -680,10 +717,20 @@ class Transformer:
     # main KV reflects positions [0, prompt_len). start_pos == prompt_len.
     # self._mtp_h_buf holds the hidden at position prompt_len-1 used to predict tokens[-1].
 
-    # Now that all SSM blocks have called _init_state during prefill, allocate per-position history buffers.
-    for blk in self.blk:
-      # Only positions [0, K-1] are ever restored (full accept skips restore); skip writing position K.
-      if isinstance(blk, GatedDeltaNetBlock): blk._alloc_history(verify_T - 1)
+    # Now that all SSM blocks have called _init_state during prefill, allocate the verify-position
+    # state stack (size verify_T so accept ∈ [0, verify_T-1] = [0, K] all index valid slots) and
+    # seed rs_stack[K] from the post-prefill recurrent_state. The mtp_accept UOp is bound at each
+    # verify call site and stashed on blocks inside _verify_forward (see the body there).
+    v_mtp_accept = UOp.variable("mtp_accept", 0, k)
+    ssm_blocks:list[GatedDeltaNetBlock] = [blk for blk in self.blk if isinstance(blk, GatedDeltaNetBlock)]
+    # Pre-stash the unbound variable so it's referenced in the JIT trace (the BOUND version is also
+    # stashed inside _verify_forward; both reference the same Variable so trace bookkeeping aligns).
+    seed_ops:list[Tensor] = []
+    for blk in ssm_blocks:
+      blk._alloc_history(verify_T)
+      blk._mtp_accept_uop = v_mtp_accept
+      seed_ops.extend(blk._seed_history_from_state(k))   # rs_stack[K] = current recurrent_state
+    if seed_ops: Tensor.realize(*seed_ops)
 
     # MTP heads share absolute RoPE position with the main sequence — initialize to the post-prefill position
     # and advance by the number of committed tokens each iter (accept drafts + 1 verify-bonus).
@@ -706,9 +753,13 @@ class Transformer:
     dbg_i = 0
     prof_accept_hist:collections.Counter = collections.Counter()
     prof_sums = {"draft": 0.0, "verify": 0.0, "rollback_seed": 0.0, "iters": 0, "committed": 0}
+    prof_rs_by_accept:dict[int, list[float]] = {a: [] for a in range(k+1)}
     def _sync():
       if prof: Tensor([0], device=t.device).realize()
 
+    # accept value to use for the NEXT verify call's mtp_accept binding. Seed = K so the first iter
+    # reads its starting SSM state from rs_stack[K] (which we just seeded from recurrent_state above).
+    prev_accept = k
     while len(tokens) < self.max_context:
       # ----- draft k tokens with the MTP heads -----
       _sync()
@@ -731,14 +782,15 @@ class Transformer:
       t_verify = time.perf_counter() if prof else 0.0
 
       # ----- verify: T=K+1 forward over [last_committed, drafts[0..K-1]] in one main pass -----
-      # SSM blocks save per-position state to rs_history/cs_history during this forward so we
-      # can roll back to any accept position in O(1) (no sequential re-advance forwards needed).
-      ssm_blocks = [blk for blk in self.blk if isinstance(blk, GatedDeltaNetBlock)]
+      # SSM blocks save per-position state to rs_stack/cs_stack during this forward AND read their
+      # starting state from rs_stack[mtp_accept] — so no explicit restore copy is needed between iters
+      # on partial accept; rebinding mtp_accept on the NEXT call selects the right slot in-place.
       verify_stage[0] = last_committed
       for i, d in enumerate(drafts): verify_stage[i+1] = d
       verify_buf.uop.buffer.copyin(memoryview(verify_stage))
       sp = v_start_pos.bind(start_pos)
-      samples = self.mtp_verify_jit(verify_buf, sp, temp).realize()  # (1, K+1, 1)
+      acc = v_mtp_accept.bind(prev_accept)
+      samples = self.mtp_verify_jit(verify_buf, sp, acc, temp).realize()  # (1, K+1, 1)
       # One host sync via .tolist() instead of verify_T separate .item() calls — each .item() on a
       # sliced view forces a fresh host-device sync (~44 ms on AMD).
       pred = samples.reshape(verify_T).tolist()
@@ -762,13 +814,11 @@ class Transformer:
       # Committed sequence: drafts[0..accept-1] + pred[accept]. j+1 tokens. (When accept==K, pred[K] is bonus.)
       new_tokens = drafts[:accept] + [pred[accept]]
 
-      # Roll back SSM state to verify position `accept` (state after processing verify input[accept]).
-      # KV cache rollback is implicit (positional writes; next iter overwrites stale slots).
-      # Batch SSM rollback (on partial accept) + _mtp_h_buf seed into a single realize/sync.
-      post_ops = [self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :])]
-      if ssm_blocks and accept < k:
-        post_ops.extend(t for blk in ssm_blocks for t in blk.restore_to_position(accept))
-      Tensor.realize(*post_ops)
+      # SSM rollback is now free: next iter binds mtp_accept=accept and the verify body reads
+      # rs_stack[accept] / cs_stack[accept] directly as its starting state. Only seed _mtp_h_buf
+      # from the verify hidden slice — that sync is the irreducible verify-GPU-completion wait.
+      Tensor.realize(self._mtp_h_buf.assign(self._verify_h_buf[:, accept:accept+1, :]))
+      prev_accept = accept
 
       start_pos += accept + 1
       mtp_start_pos += accept + 1
@@ -779,17 +829,20 @@ class Transformer:
         t_end = time.perf_counter()
         prof_sums["draft"] += (t_verify - t_draft) * 1000
         prof_sums["verify"] += (t_rollback - t_verify) * 1000
-        prof_sums["rollback_seed"] += (t_end - t_rollback) * 1000
+        rs_ms = (t_end - t_rollback) * 1000
+        prof_sums["rollback_seed"] += rs_ms
         prof_sums["iters"] += 1
         prof_sums["committed"] += len(new_tokens)
         prof_accept_hist[accept] += 1
+        prof_rs_by_accept[accept].append(rs_ms)
         if prof_sums["iters"] % prof == 0:
           n = prof_sums["iters"]
           hist = " ".join(f"{a}:{prof_accept_hist[a]}" for a in range(k+1))
           mean_accept = sum(a*c for a,c in prof_accept_hist.items()) / n
+          rs_by = " ".join(f"{a}:{(sum(v)/len(v)) if v else 0:.0f}ms(n={len(v)})" for a, v in prof_rs_by_accept.items())
           print(f"[mtp-prof] iters={n} K={k} draft={prof_sums['draft']/n:.1f}ms verify={prof_sums['verify']/n:.1f}ms "
                 f"rollback+seed={prof_sums['rollback_seed']/n:.1f}ms accept_mean={mean_accept:.2f} "
-                f"tok/iter={prof_sums['committed']/n:.2f} hist[{hist}]", flush=True)
+                f"tok/iter={prof_sums['committed']/n:.2f} hist[{hist}] rs_by_accept[{rs_by}]", flush=True)
 
       for nt in new_tokens:
         tokens.append(nt)
