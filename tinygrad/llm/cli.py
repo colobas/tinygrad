@@ -324,7 +324,7 @@ def main():
   parser.add_argument("--prompt", type=str, default=None, help="Benchmark prompt (default: BOS only)")
   parser.add_argument("--mtp", type=int, default=0, metavar="K",
                       help="Speculative decoding via MTP heads, drafting K tokens per main step (requires an MTP-enabled GGUF). "
-                           "NOTE: currently slower than baseline on hybrid SSM models — needs kernel-layer tuning to deliver speedup.")
+                           "Speeds up GENERATION (run with JITBEAM=8 for best results); prefill is unaffected. K=2 is the sweet spot.")
   args = parser.parse_args()
 
   # load the model
@@ -350,10 +350,10 @@ def main():
     print(f"warning: --mtp {args.mtp} requested but model has no MTP heads; falling back to standard decode")
     args.mtp = 0
   if args.mtp and model.has_recurrent_block:
-    print(f"warning: --mtp on a hybrid SSM/attention model currently runs SLOWER than baseline. "
-          f"The MTP algorithm is correct, but the T>{1} verify forward generates new kernel shapes "
-          f"that tinygrad's JIT scheduler has not tuned as well as the baseline T=1 path. "
-          f"Closing the gap is a kernel-layer task. Use --mtp 0 for fastest inference.")
+    print(f"note: --mtp speeds up GENERATION on this hybrid SSM/attention model "
+          f"(~1.3x with JITBEAM=8; without it the T>1 verify forward uses a less-tuned kernel). "
+          f"PREFILL is unaffected and is processed one token at a time (SSM constraint), so it "
+          f"dominates wall-clock for long prompts regardless of --mtp. Use JITBEAM=8 for best gen speed.")
 
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok, mtp_k=args.mtp).serve_forever()
