@@ -176,6 +176,31 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       np.testing.assert_allclose(recurrent_state, expected_recurrent[step], rtol=1e-3, atol=1e-3,
                                  err_msg=f"GatedDeltaNet reset recurrent cache mismatch at step {step}")
 
+  def test_gatedeltanet_chunked_prefill_matches_per_token(self):
+    # Chunked SSM prefill runs _attention_tn over a concrete-T chunk; its per-position outputs and
+    # final conv/recurrent state must match the token-at-a-time reference (rs_stack/verify-mode off).
+    config = self._make_config(max_context=4)
+    block = self._make_block(config)
+    T = 3
+    x = Tensor.linspace(-1.0, 1.0, T * config.dim, dtype=dtypes.float32).reshape(1, T, config.dim)
+    expected_outs, expected_conv, expected_recurrent = self._naive_attention(block, x)
+
+    x_norm = block.attn_norm(x)
+    block._init_state(x_norm)
+    self.assertIsNone(block.rs_stack)            # verify stack not allocated during prefill
+    self.assertIsNone(block._mtp_accept_uop)     # not in verify mode -> reads/writes live state only
+    out_tn = block._attention(x_norm, 0).realize().numpy()   # dispatches to _attention_tn (T>1)
+    self.assertEqual(out_tn.shape, (1, T, config.dim))
+    conv_state, recurrent_state = self._cache_views(block)
+
+    for t in range(T):
+      np.testing.assert_allclose(out_tn[:, t:t+1, :], expected_outs[t], rtol=1e-3, atol=1e-3,
+                                 err_msg=f"chunked-prefill output mismatch at position {t}")
+    np.testing.assert_allclose(conv_state, expected_conv[-1], rtol=1e-3, atol=1e-3,
+                               err_msg="chunked-prefill final conv state mismatch")
+    np.testing.assert_allclose(recurrent_state, expected_recurrent[-1], rtol=1e-3, atol=1e-3,
+                               err_msg="chunked-prefill final recurrent state mismatch")
+
 class TestPairwiseTopk(unittest.TestCase):
   def test_basic_topk(self):
     x = Tensor([[[1.0, 3.0, 2.0, 5.0, 4.0]]])

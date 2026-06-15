@@ -352,8 +352,10 @@ def main():
   if args.mtp and model.has_recurrent_block:
     print(f"note: --mtp speeds up GENERATION on this hybrid SSM/attention model "
           f"(~1.3x with JITBEAM=8; without it the T>1 verify forward uses a less-tuned kernel). "
-          f"PREFILL is unaffected and is processed one token at a time (SSM constraint), so it "
-          f"dominates wall-clock for long prompts regardless of --mtp. Use JITBEAM=8 for best gen speed.")
+          f"PREFILL is processed one token at a time (SSM constraint) and dominates wall-clock for "
+          f"long prompts regardless of --mtp. (Experimental: PREFILL_CHUNK>1 batches prefill through "
+          f"the T>1 path, but the forward doesn't yet amortize weight reads so it gives no speedup.) "
+          f"Use JITBEAM=8 for best gen speed.")
 
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok, mtp_k=args.mtp).serve_forever()

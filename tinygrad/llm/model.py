@@ -400,7 +400,10 @@ class GatedDeltaNetBlock(FFNBlock):
     recurrent_state_store = self.recurrent_state.uop.store(final_S.cast(self.recurrent_state.dtype).uop)
     conv_state_store     = self.conv_state.uop.store(final_conv.cast(self.conv_state.dtype).uop)
     stores = [recurrent_state_store, conv_state_store]
-    if self.rs_stack is not None:
+    if self.rs_stack is not None and self._mtp_accept_uop is not None:
+      # Verify-mode only (mtp_accept bound). During chunked PREFILL this path also runs at T>1 but
+      # with _mtp_accept_uop=None: we then read/write only the live conv_state/recurrent_state above,
+      # never the verify stack (whose T=K+1 sizing wouldn't match a prefill chunk's T anyway).
       # Store all T positions; accept = j picks rs_stack[j] as next iter's starting state, j ∈ [0, T-1].
       for t in range(T):
         stores.append(self.rs_stack[t].uop.store(S_list[t].cast(self.rs_stack.dtype).uop))
@@ -680,6 +683,27 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
+  def _prefill_chunked(self, t:Tensor, start_pos:int, prompt_len:int, v_start_pos:UOp, chunk:int,
+                       temp:Tensor, seed_mtp:bool) -> tuple[Tensor, int]:
+    """Chunked prefill for hybrid SSM/attention models.
+
+    Each forward processes a CONCRETE-T slice `t[:, start_pos:start_pos+nt]` (symbolic start_pos,
+    Python-int length) so GatedDeltaNetBlock._attention_tn — which Python-iterates its conv window
+    and recurrence over T — gets a concrete T at trace time, while full-attention blocks T-batch.
+    A fixed `chunk` is used while a full chunk fits; the remainder runs as a T=1 tail (reusing the
+    rollout T=1 SSM path). The forward that consumes the final prompt position uses mtp_main_jit
+    when `seed_mtp` so it seeds self._mtp_h_buf. Returns (final-forward output, new start_pos)."""
+    out_main = None
+    while start_pos < prompt_len:
+      nt = chunk if prompt_len - start_pos >= chunk else 1
+      sp = v_start_pos.bind(start_pos)
+      if seed_mtp and start_pos + nt == prompt_len:
+        out_main = self.mtp_main_jit(t[:, sp:sp+nt].contiguous(), sp, temp).realize()
+      else:
+        out_main = self(t[:, sp:sp+nt], sp, temp).realize()
+      start_pos += nt
+    return out_main, start_pos
+
   def generate_mtp(self, tokens:list[int], k:int=2, chunk_size:int=32, temperature:float=0.0):
     """Speculative decoding using the MTP heads to draft k tokens per main-model step.
 
@@ -696,11 +720,14 @@ class Transformer:
     assert self.mtp_heads, "model has no MTP heads loaded"
     assert k >= 1
     # GatedDeltaNet._attention_tn Python-iterates conv windows, so its T must be a concrete
-    # int at JIT-trace time. Verify is fixed at T=k+1; restrict prefill chunks to T=1 so
-    # symbolic chunk sizes never reach _attention_tn.
-    if self.has_recurrent_block: chunk_size = 1
+    # int at JIT-trace time. Verify is fixed at T=k+1. Prefill CAN run CONCRETE-T chunks
+    # (PREFILL_CHUNK>1) through the same _attention_tn path + a T=1 tail, but this is OFF by default
+    # (PREFILL_CHUNK=1 → token-at-a-time): on the 27B model a T=N forward does NOT amortize the
+    # weight read across N (per-T-row dispatch), so chunking gave 0 speedup AND drifts the prefill
+    # argmax vs the serial path. Kept opt-in for when the verify-kernel T-tiling work also covers
+    # prefill shapes; see the doc's "de-fuse the attn_q epilogue" next step.
+    prefill_chunk = getenv("PREFILL_CHUNK", 1) if self.has_recurrent_block else chunk_size
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
     v_mtp_sp = UOp.variable("mtp_sp", 0, self.max_context-1)
     temp = Tensor(temperature).contiguous()
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
@@ -716,17 +743,12 @@ class Transformer:
     # ----- prefill (chunked) using the standard path; ensures main KV is populated -----
     start_pos = self.get_start_pos(tokens)
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
+    # Clear any verify-mode flag left on SSM blocks by a prior generate_mtp call so prefill chunks
+    # read live conv_state/recurrent_state (not the rs_stack) — see _attention_tn's accept guard.
+    for blk in self.blk:
+      if isinstance(blk, GatedDeltaNetBlock): blk._mtp_accept_uop = None
     prompt_len = len(tokens)
-    out_main = None
-    while start_pos < prompt_len:
-      nt = min(chunk_size, prompt_len - start_pos)
-      sp, ntb = v_start_pos.bind(start_pos), v_toks.bind(nt)
-      # last prefill chunk: use _forward_with_hidden so we can seed MTP. Earlier chunks: standard forward.
-      if start_pos + nt == prompt_len:
-        out_main = self.mtp_main_jit(t[:, sp:sp+ntb].contiguous(), sp, temp).realize()
-      else:
-        out_main = self(t[:, sp:sp+ntb], sp, temp).realize()
-      start_pos += nt
+    out_main, start_pos = self._prefill_chunked(t, start_pos, prompt_len, v_start_pos, prefill_chunk, temp, seed_mtp=True)
 
     # commit the first sampled token (from the last prefill chunk)
     tokens.append(int(out_main.item()))
@@ -879,9 +901,7 @@ class Transformer:
         if len(tokens) >= self.max_context: return
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
@@ -889,7 +909,23 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
-    out, prompt_len = None, len(tokens)
+    prompt_len = len(tokens)
+    if self.has_recurrent_block:
+      # SSM blocks need a concrete T (their conv/recurrence is Python-unrolled). Prefill runs
+      # CONCRETE-T chunks (PREFILL_CHUNK) + a T=1 tail, then generates at T=1. Default PREFILL_CHUNK=1
+      # = token-at-a-time (byte-identical serial prefill); >1 is opt-in and currently gives no
+      # speedup on the 27B model (the T>1 forward doesn't amortize the weight read — see generate_mtp).
+      out, start_pos = self._prefill_chunked(t, start_pos, prompt_len, v_start_pos, getenv("PREFILL_CHUNK", 1),
+                                             temp, seed_mtp=False)
+      while True:
+        tokens.append(int(out.item()))
+        self._cached_tokens = tokens[:-1]
+        yield tokens[-1]
+        if len(tokens) >= self.max_context: return
+        out = self(out, v_start_pos.bind(start_pos), temp).realize()
+        start_pos += 1
+    v_toks = UOp.variable("toks", 1, chunk_size)
+    out = None
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
