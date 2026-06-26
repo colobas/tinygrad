@@ -5,7 +5,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.helpers import Timing, Context, cdiv
 from tinygrad.dtype import dtypes, ConstFloat  # noqa: F401
 from tinygrad.device import Device
-from tinygrad.uop.ops import Ops, UOp, UPat, exec_alu
+from tinygrad.uop.ops import Ops, ParamArg, UOp, UPat, exec_alu  # noqa: F401  # ParamArg used by eval(str(uop)) roundtrip tests
 from tinygrad.uop.spec import spec_shared
 from tinygrad.uop.symbolic import sym
 from test.helpers import eval_uop, to_uops_list
@@ -355,13 +355,13 @@ class TestUOpRender(unittest.TestCase):
     self.assertEqual(u.render(), "{}")
   def test_render_vectorize_same(self):
     u = UOp(Ops.STACK, dtype=dtypes.int.vec(3), src=(UOp.const(dtypes.int, 0), UOp.const(dtypes.int, 0), UOp.const(dtypes.int, 0)))
-    self.assertEqual(u.render(simplify=False), "{0, ...}")
+    self.assertEqual(u.render(simplify=False), "{0,0,0}")
   def test_render_vectorize_different(self):
     u = UOp(Ops.STACK, dtype=dtypes.int.vec(3), src=(UOp.const(dtypes.int, 0), UOp.const(dtypes.int, 1), UOp.const(dtypes.int, 2)))
     self.assertEqual(u.render(simplify=False), "{0,1,2}")
   def test_render_vectorize_same_simplified(self):
     u = UOp(Ops.STACK, dtype=dtypes.int.vec(3), src=(UOp.const(dtypes.int, 0), UOp.const(dtypes.int, 0), UOp.const(dtypes.int, 0)))
-    self.assertEqual(u.render(), "0")
+    self.assertEqual(u.render(), "{0,0,0}")
   def test_render_vectorize_different_simplified(self):
     u = UOp(Ops.STACK, dtype=dtypes.int.vec(3), src=(UOp.const(dtypes.int, 0), UOp.const(dtypes.int, 1), UOp.const(dtypes.int, 2)))
     self.assertEqual(u.render(), "{0,1,2}")

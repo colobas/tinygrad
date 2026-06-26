@@ -85,7 +85,7 @@ class PythonProgram:
           i += 1
           continue
         if u.op is Ops.AFTER: values[u] = src_values[0]
-        elif u.op is Ops.PARAM and u.addrspace is None: values[u] = [pvals.pop(0)] * warp_size
+        elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: values[u] = [pvals.pop(0)] * warp_size
         elif u.op in {Ops.PARAM, Ops.BUFFER}:
           storage_fmt = storage_fmt_for_dtype(u.dtype.base.scalar())
           if storage_fmt is None: raise RuntimeError(f"dtype={u.dtype} is not supported")
@@ -105,7 +105,7 @@ class PythonProgram:
           if u.src[0].addrspace == AddrSpace.ALU:
             ret = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
           elif isinstance(src_dtypes[0], ImageDType):
-            assert len(src_values) == 3, "image index must be 3 srcs"
+            assert len(src_values) == 3, f"image index must be 3 srcs, not {len(src_values)}"
             for m,oy,ox in zip(*src_values):
               if ox < 0 or ox >= src_dtypes[0].shape[1] or oy < 0 or oy >= src_dtypes[0].shape[0]: ret.append((m, None))
               else: ret.append((m, ox*4 + oy*src_dtypes[0].shape[1]*4))

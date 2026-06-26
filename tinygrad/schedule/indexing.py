@@ -8,8 +8,8 @@ from tinygrad.uop.symbolic import symbolic, pm_simplify_valid, pm_drop_and_claus
 from tinygrad.helpers import argsort, all_same, cpu_profile, PCONTIG, colored, Context, SPEC
 
 ALWAYS_CONTIGUOUS: set[Ops] = {Ops.CONTIGUOUS, Ops.AFTER, Ops.COPY, Ops.BUFFER, Ops.SLICE,
-                     Ops.CONST, Ops.BIND, Ops.DEVICE, Ops.MSELECT, Ops.MSTACK, Ops.PARAM,
-                     Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.LOAD, Ops.CALL, Ops.FUNCTION}
+                      Ops.CONST, Ops.BIND, Ops.DEVICE, Ops.MSELECT, Ops.MSTACK, Ops.PARAM,
+                      Ops.LOAD, Ops.CALL, Ops.FUNCTION}
 
 def realize(ctx:dict[UOp, None], tr:UOp) -> None: ctx[tr] = None
 
@@ -141,7 +141,7 @@ def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UO
         symbolic+pm_simplify_valid, name="pad").where(r-off, UOp.invalid()) for r,sh,(off,sz) in zip(rngs, in_shape, arg))
     case Ops.RESHAPE:
       sink = UOp.sink(*rngs).simplify() # NOTE: this applies any commutative flips to the rngs early
-      sub_array = {r:UOp.range(r.src[0], i, AxisType.PLACEHOLDER) for i,r in enumerate(sink.ranges)}
+      sub_array = {r:UOp.range(r.src[0], i, AxisType.PLACEHOLDER, dtype=r.dtype) for i,r in enumerate(sink.ranges)}
       rngs = _apply_reshape(in_shape, arg, sink.substitute(sub_array)).substitute({v:k for k,v in sub_array.items()}).src
     case _: raise RuntimeError(f"{op} is not a MovementOp")
   return rngs
@@ -161,7 +161,7 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
   # explicit rangeify
   ending_ranges: dict[UOp, list[UOp]] = {}
   for x in reversed(tsink_toposort):
-    if x.op in {Ops.DEVICE, Ops.UNIQUE}: continue
+    if x.op is Ops.DEVICE: continue
 
     # no ranges on kernels, they are internal
     if x.op in {Ops.CALL, Ops.FUNCTION, Ops.LINEAR}: continue

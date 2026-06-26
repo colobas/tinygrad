@@ -1,4 +1,4 @@
-from typing import Literal, Callable, cast
+from typing import Literal, Callable
 import math, sys, struct
 from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
@@ -22,6 +22,7 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_type(x)})" \
     if x.max_numel() > 1 and x.addrspace is AddrSpace.REG else None),
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"({ctx.render_cast(x, ctx[x.src[0]])})"),
+  (UPat(Ops.BITCAST, name="x"), lambda ctx,x: ctx[x.src[0]] if x.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
   (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"__builtin_bit_cast({ctx.render_type(x)}, ({ctx.render_type(x.src[0])})({ctx[x.src[0]]}))"),
 
   # GPU stuff
@@ -158,10 +159,9 @@ class CStyleLanguage(Renderer):
     return f"({self[buf]}+{strip_parens(self[idx]) if idx.arg == Ops.ADD else self[idx]})"
 
   def render_buffer(self, x:UOp):
-    shp = x.src[0].as_shape
     lanes = 1
     prefix = f"{self.smem_align}{self.smem_prefix}" if x.addrspace == AddrSpace.LOCAL else ""
-    suffix = f"[{shp[0]}]" if len(shp) else ""
+    suffix = f"[{x.max_numel()}]"
     return f"{prefix}{self._render_dtype(x.dtype, sz=lanes)} {self[x]}{suffix};"
 
   def _render_dtype(self, dtype:DType, sz:int=1, addrspace=AddrSpace.ALU, mutable=True, override_ptr=False):
@@ -223,7 +223,7 @@ class CStyleLanguage(Renderer):
                   Ops.INDEX: "bidx", Ops.LOAD: "val"}.get(u.op, "alu")
         r[u] = f"{prefix}{c[prefix]}"
 
-      l = cast(str, self.string_rewrite.rewrite(u, ctx=self))
+      l: str|None = self.string_rewrite.rewrite(u, ctx=self)
       assert l is not None, f"failed to render {u.op} {u.dtype} {[(x.op,x.dtype) for x in u.src]} {u.arg}"
 
       if u.op in {Ops.ENDIF, Ops.END}: depth -= 1

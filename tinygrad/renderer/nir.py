@@ -1,4 +1,4 @@
-from typing import Callable, cast, Any
+from typing import Callable, Any
 from tinygrad.dtype import AddrSpace, DType, ImageDType, dtypes, truncate
 from tinygrad.helpers import DEBUG, OSX, unwrap, fromimport, Target
 from tinygrad.renderer import Renderer
@@ -145,7 +145,7 @@ class NIRRenderer(Renderer):
 
   def_rewrite = PatternMatcher([
     (UPat(Ops.CONST, name="x"), lambda ctx,x: nimm(ctx.b, x.arg, x.dtype)),
-    (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx.param(ctx.b, x, 8 if x.addrspace is not None else x.dtype.itemsize)),
+    (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx.param(ctx.b, x, x.dtype.itemsize if x.addrspace is AddrSpace.ALU else 8)),
     (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: nchannel(ctx.b, {'g':ngid, 'l':nlid, 'i': nid}[x.arg[0]](ctx.b), int(x.arg[-1]))),
     (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"),UPat.var("off")), allow_any_len=True), UPat.var("val"))),
      lambda ctx,buf,off,val: nstore(ctx.b, buf.addrspace, nidx(ctx.b, ctx.r[buf], ctx.r[off], buf.addrspace, buf.dtype.itemsize), ctx.r[val])),
@@ -216,8 +216,9 @@ class NIRRenderer(Renderer):
         nstore(self.b, AddrSpace.REG, ranges.pop(), next_i),
         mesa.nir_pop_loop(self.b, None)
       else:
-        if (d:=self.def_rewrite.rewrite(u, ctx=self)) is None: raise RuntimeError(f"failed to render {u.op} srcs {[x.dtype for x in u.src]}")
-        self.r[u] = cast(mesa.nir_def, d)
+        d: mesa.nir_def|None = self.def_rewrite.rewrite(u, ctx=self)
+        if d is None: raise RuntimeError(f"failed to render {u.op} srcs {[x.dtype for x in u.src]}")
+        self.r[u] = d
     self.postrender(uops)
 
     mesa.nir_validate_shader(self.b.shader, b"after render")
@@ -256,7 +257,7 @@ class LVPRenderer(NIRRenderer):
 
   def prerender(self, uops:list[UOp]):
     super().prerender(uops)
-    self.param_sz = sum([8 if u.addrspace is not None else u.dtype.itemsize for u in uops if u.op is Ops.PARAM])
+    self.param_sz = sum([u.dtype.itemsize if u.addrspace is AddrSpace.ALU else 8 for u in uops if u.op is Ops.PARAM])
 
 def tovec(b, idx_y, idx_x): return nalu(b, "vec4", idx_x, idx_y, nundef(b, dtypes.int), nundef(b, dtypes.int))
 def nfloat(dtype): return mesa.nir_type_float16 if dtype == dtypes.half else mesa.nir_type_float32
@@ -296,10 +297,11 @@ class IR3Renderer(NIRRenderer, OpenCLRenderer):
     super().prerender(uops)
     self.texs:set[UOp] = set()
     self.img_idx = 0
-    self.param_sz = sum([8 if u.addrspace is not None else u.dtype.itemsize for u in uops if u.op is Ops.PARAM])
+    self.param_sz = sum([u.dtype.itemsize if u.addrspace is AddrSpace.ALU else 8 for u in uops if u.op is Ops.PARAM])
 
   def postrender(self, uops:list[UOp]):
-    bufs, texs, imgs = [u for u in uops if u.op is Ops.PARAM and u.addrspace is not None], itertools.count().__next__, itertools.count().__next__
+    bufs = [u for u in uops if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU]
+    texs, imgs = itertools.count().__next__, itertools.count().__next__
     for b in filter(lambda b: isinstance(b.dtype, ImageDType), bufs): nimm_set(self.r[b], texs() if b in self.texs else imgs(), dtypes.int)
 
     self.b.shader.contents.info.num_ubos = len([u for u in bufs if not isinstance(u.dtype, ImageDType)])

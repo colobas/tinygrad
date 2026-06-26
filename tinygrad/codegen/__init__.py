@@ -1,54 +1,55 @@
-from typing import cast
 from dataclasses import replace
 import itertools
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
 from tinygrad.helpers import ALLOW_TF32, TracingKey, Context, panic
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, pm_lower_index_dtype, Ops, UPat, track_rewrites, KernelInfo, ProgramInfo, GroupOp
-from tinygrad.uop.ops import ParamArg
 from tinygrad.uop.render import pyrender
 from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
 from tinygrad.renderer import Renderer, Estimates
 from tinygrad.renderer.isa import ISARenderer, IselContext, PreRegAllocContext
-from tinygrad.dtype import dtypes, PtrDType, ImageDType, AddrSpace
+from tinygrad.dtype import dtypes, PtrDType, ImageDType
 
 # import all pattern matchers here
 from tinygrad.codegen.gpudims import pm_add_gpudims
 from tinygrad.uop.symbolic import sym, symbolic_simple, gep_pushing, symbolic, pm_move_where_on_load, pm_clean_up_group_sink, pm_remove_invalid
-from tinygrad.uop.decompositions import get_late_rewrite_patterns, get_transcendental_patterns, pm_dtype_decomps
+from tinygrad.codegen.decomp.dtype import pm_dtype_decomps
+from tinygrad.codegen.decomp.op import get_late_rewrite_patterns, get_simplifying_rewrite_patterns
+from tinygrad.codegen.decomp.transcendental import get_transcendental_patterns
 from tinygrad.codegen.late.expander import expander, pm_pre_expander, pm_group_for_reduce
-from tinygrad.codegen.late.devectorizer import load_store_folding, load_store_indexing, devectorize_buf_and_index, devectorize_alu, pm_reduce, \
-  ReduceContext, correct_load_store, pm_render, pm_add_loads, pm_make_images
+from tinygrad.codegen.late.devectorizer import load_store_folding, indexing_simplify, devectorize_buf_and_index, devectorize_alu, pm_reduce, \
+  ReduceContext, correct_load_store, pm_render, pm_add_loads
 from tinygrad.codegen.opt.postrange import apply_opts
 from tinygrad.codegen.late.gater import pm_move_gates_from_index
 from tinygrad.codegen.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse
 from tinygrad.schedule.rangeify import pm_add_buffers_local, rangeify_codegen, pm_mops, pm_syntactic_sugar, pm_store_ranges
 from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
-
-pm_index_is_shrink = PatternMatcher([
-  # rewrite non-image INDEX to SHRINK
-  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("idx"))).cast(name="x"), lambda buf,idx,x:
-    UOp(Ops.SHRINK, dtype=x.dtype.base, src=(buf, idx, UOp.const(dtypes.int, x.dtype.count))) \
-      if isinstance(buf.dtype, PtrDType) and x.dtype.count > 1 else None),
-  # rewrite GEP to INDEX
-  (UPat(Ops.GEP, name="x"), lambda x: x.replace(op=Ops.INDEX, src=x.src+(UOp.const(dtypes.int, x.arg),), arg=None)),
-])
+from tinygrad.codegen.late.coalese import memory_coalesing, pm_simplify_add_image
 
 pm_remove_vec_dtypes = PatternMatcher([
   # rewrite PARAM to non pointer
-  (UPat((Ops.PARAM, Ops.BUFFER, Ops.DEFINE_LOCAL, Ops.DEFINE_REG), name="buf"), lambda buf:
+  (UPat((Ops.PARAM, Ops.BUFFER), name="buf"), lambda buf:
    buf.replace(dtype=buf.dtype.base, src=(UOp.const(dtypes.int, buf.ptrdtype.size),)) \
     if isinstance(buf.dtype, PtrDType) and not isinstance(buf.dtype, ImageDType) else None),
   # remove all vec dtypes
-  (UPat(GroupOp.All-{Ops.PARAM, Ops.BUFFER, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}, name="x"),
+  (UPat(GroupOp.All-{Ops.PARAM, Ops.BUFFER}, name="x"),
    lambda x: x.replace(dtype=x.dtype.base.scalar().base)),
-  # replace DEFINE_LOCAL/DEFINE_REG with BUFFER
-  (UPat((Ops.DEFINE_LOCAL, Ops.DEFINE_REG), name="x"), lambda x:
-   x.replace(op=Ops.BUFFER, arg=ParamArg(x.arg, addrspace=AddrSpace.LOCAL if x.op == Ops.DEFINE_LOCAL else AddrSpace.REG))),
-  # replace DEFINE_VAR with PARAM
-  (UPat(Ops.DEFINE_VAR, name="x"), lambda ctx,x:
-   x.replace(op=Ops.PARAM, src=(UOp(Ops.STACK),), arg=ParamArg(slot=ctx[x.arg[0]], name=x.arg[0], vmin_vmax=x.arg[1:], addrspace=None))),
+  # rewrite GEP to INDEX
+  (UPat(Ops.GEP, name="x"), lambda x: x.replace(op=Ops.INDEX, src=x.src+(UOp.const(dtypes.int, x.arg if len(x.arg) > 1 else x.arg[0]),), arg=None)),
 ])+pm_clean_up_group_sink
+
+def do_number_param(ctx:list[int], x:UOp):
+  if x.arg.slot != -1: return None
+  ctx[0] += 1
+  return x.replace(arg=replace(x.arg, slot=ctx[0]-1))
+
+pm_number_params = PatternMatcher([
+  (UPat(Ops.PARAM, name="x"), do_number_param),
+])
+
+pm_no_weakints = PatternMatcher([
+  (UPat(GroupOp.All, dtype=dtypes.weakint, name="x"), lambda x: x.replace(dtype=dtypes.int))
+])
 
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
@@ -76,7 +77,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
     sink = apply_opts(sink, ren, beam=ast.arg.beam)
 
   # ** expander (expand_rewrite) **
-  sink = graph_rewrite(sink, sym+pm_move_where_on_load, name="postopt symbolic")
+  sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range, name="postopt symbolic")
 
   # expand
   sink = graph_rewrite(sink, sym+pm_pre_expander+pm_group_for_reduce+expander, name="expander")
@@ -96,48 +97,59 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # add loads and remove invalids
   sink = graph_rewrite(sink, pm_add_loads+pm_remove_invalid, name="** add loads (code)")
 
-  # create image buffers
-  if IMAGE and ren.target.device in {"QCOM", "CL", "PYTHON", "NULL"}:
-    sink = graph_rewrite(sink, pm_make_images, name="create image buffers", bottom_up=True, ctx=ren.target.arch)
-
   # devectorize
-  sink = graph_rewrite(sink, sym+devectorize_alu+devectorize_buf_and_index+load_store_folding+correct_load_store+load_store_indexing,
-                       ctx=ren, name="devectorize")
+  sink = graph_rewrite(sink, sym+devectorize_alu+devectorize_buf_and_index+load_store_folding+correct_load_store, ctx=ren, name="devectorize")
 
-  # lower the index dtype to a concrete int
-  sink = graph_rewrite(sink, pm_lower_index_dtype+load_store_indexing+gep_pushing, name="lower all index dtypes")
-  sink = graph_rewrite(sink, symbolic, name="post index symbolic")
+  # this is new style (TODO: this should all be removed)
+  sink = graph_rewrite(sink, pm_render, name="pm_render gep/stack")
+  sink = graph_rewrite(sink, pm_remove_vec_dtypes, name="transform to new style")
+
+  # simplify indexing
+  sink = graph_rewrite(sink, indexing_simplify, name="simplify load/store indexing")
+
+  # do memory coalesing (late)
+  sink = memory_coalesing(sink, ren)
+  sink = graph_rewrite(sink, pm_simplify_add_image, name="add images", ctx=({}, ren), bottom_up=True)
+
+  # extra symbolic before decomp. crashes without this?
+  sink = graph_rewrite(sink, symbolic, name="extra symbolic")
+
+  # lower index dtype
+  # NOTE: we need indexing_simplify to remove the cast to long using the Invalid
+  sink = graph_rewrite(sink, pm_lower_index_dtype+indexing_simplify, name="lower all index dtypes")
+
+  # final symbolic before decomp
+  sink = graph_rewrite(sink, symbolic, name="final symbolic")
+
+  # **** decomps ****
 
   # optional pre matcher
   if ren.pre_matcher is not None: sink = graph_rewrite(sink, ren.pre_matcher, name="pre_matcher")
 
-  # decompositions
+  # floordiv+mod / dtype decomp (early)
   supported_ops = tuple(ren.code_for_op.keys())
-  pm_decomp = symbolic_simple+get_late_rewrite_patterns(supported_ops, bool(DISABLE_FAST_IDIV))
-  pm_transcendental = symbolic_simple+get_transcendental_patterns(supported_ops, TRANSCENDENTAL>=2)
-  sink = graph_rewrite(sink, pm_decomp, ctx=ren, name="decompositions")
+  pm_decomp = symbolic_simple+get_simplifying_rewrite_patterns(supported_ops)
+  sink = graph_rewrite(sink, pm_decomp, name="early decompositions")
+
+  # late decomps + move gates from unrenderable INVALID where
   sink = graph_rewrite(sink, pm_dtype_decomps, ctx=(set(), ren), name="decomp dtypes")
-  sink = graph_rewrite(sink, pm_transcendental, name="transcendental")
-
-  # GEP/STACK stuff
-  sink = graph_rewrite(sink, pm_render, name="pm_render gep/stack")
-
-  # this is new style
-  sink = graph_rewrite(sink, pm_index_is_shrink, name="index is shrink")
-  num_params = len([x for x in sink.toposort() if x.op is Ops.PARAM])
-  name_to_slot = {nm:num_params+i for i,nm in enumerate(sorted([x.arg[0] for x in sink.toposort() if x.op is Ops.DEFINE_VAR]))}
-  sink = graph_rewrite(sink, pm_remove_vec_dtypes, ctx=name_to_slot, name="transform to new style")
-
-  # move gates from unrenderable INVALID where
+  pm_decomp = pm_decomp+\
+    get_late_rewrite_patterns(supported_ops, bool(DISABLE_FAST_IDIV))+\
+    get_transcendental_patterns(supported_ops, TRANSCENDENTAL>=2)
+  sink = graph_rewrite(sink, pm_decomp, ctx=ren, name="late decompositions")
   sink = graph_rewrite(sink, pm_move_gates_from_index, name="move gates from index")
 
   # final rules for the renderer (without sym)
   extra_matcher = ren.extra_matcher if ren.extra_matcher is not None else PatternMatcher([])
-  pm_final_rewrite = pm_decomp+extra_matcher+pm_split_ends
+  pm_final_rewrite = pm_decomp+extra_matcher+pm_split_ends+pm_no_weakints
   sink = graph_rewrite(sink, pm_final_rewrite, ctx=ren, name="final rewrite")
 
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
+
+  # put unnumbered variable PARAMs in slots
+  num_params = len([x for x in sink.toposort() if x.op is Ops.PARAM and x.arg.slot != -1])
+  sink = graph_rewrite(sink, pm_number_params, ctx=[num_params], name="number params with -1", walk=True)
 
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Output AST")
   if SPEC: type_verify(sink, spec_program)
@@ -160,7 +172,7 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
   replaced: dict[UOp, UOp] = {}
   for u in lst:
     nu = u.replace(src=tuple([replaced.get(x, x) for x in u.src]))
-    ret: tuple[UOp, list[UOp]] = cast(tuple[UOp, list[UOp]]|None, pm.rewrite(nu, ctx)) or (nu, [nu])
+    ret: tuple[UOp, list[UOp]] = pm.rewrite(nu, ctx) or (nu, [nu])
     replaced[u] = ret[0]
     newlst.extend(ret[1])
   return newlst
@@ -171,6 +183,8 @@ def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   # isa renderers need to allocate registers
   if isinstance(ctx, ISARenderer):
     if ctx.pre_regalloc_matcher is not None: lst = line_rewrite(lst, ctx.pre_regalloc_matcher, PreRegAllocContext())
+    # register definitions (INS without srcs) move to the top so regalloc sees their live ranges span the whole program (callee saved regs)
+    lst = sorted(lst, key=lambda u: u.op is not Ops.INS or bool(u.src))
     regalloc_ctx = LinearScanRegallocContext(lst, ctx)
     lst = line_rewrite(lst, pm_regalloc_rewrite, regalloc_ctx)
     lst = line_rewrite(lst, ctx.post_regalloc_matcher, regalloc_ctx)
