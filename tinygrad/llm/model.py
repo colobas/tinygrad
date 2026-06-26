@@ -309,16 +309,34 @@ class Transformer:
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    # constrained decoding (§7): separate JITs that add a per-token logit bias before sampling. Kept apart
+    # from the unmasked JITs above so the default decode path is byte-identical and pays nothing (opt-in).
+    self.masked_prefill_jit = TinyJit(self.forward_masked)
+    self.masked_rollout_jit = TinyJit(self.forward_masked)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def _logits(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
-    logits = self.output(self.output_norm(x))[:, -1, :]
+    return self.output(self.output_norm(x))[:, -1, :]
+
+  def _sample(self, logits:Tensor, temperature:Tensor) -> Tensor:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    return self._sample(self._logits(tokens, start_pos), temperature)
+
+  def forward_masked(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor) -> Tensor:
+    # logit_bias is additive: 0.0 for grammar-permitted tokens, a large negative for forbidden ones, so the
+    # argmax can only land on a permitted token. The bias is a graph input, so no recompile per step.
+    return self._sample(self._logits(tokens, start_pos) + logit_bias, temperature)
+
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+
+  def call_masked(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor) -> Tensor:
+    jit = self.masked_prefill_jit if resolve(tokens.shape[1] != 1) else self.masked_rollout_jit
+    return jit(tokens.contiguous(), start_pos, temperature, logit_bias)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -393,7 +411,10 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mask_fn=None):
+    # mask_fn (optional, §7) is given the completion-so-far token ids and returns a vocab-length additive
+    # logit bias (0 = allowed, large-negative = forbidden) for the next token, or None to leave it unmasked.
+    # When mask_fn is None the unmasked decode path runs unchanged.
     if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -406,8 +427,14 @@ class Transformer:
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      nt_val = min(chunk_size, len(tokens) - start_pos)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(nt_val)
+      inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
+      # this call emits a sampled token iff it consumes the rest of the context; only those need masking
+      if mask_fn is not None and start_pos + nt_val >= len(tokens) and (bias := mask_fn(tokens[prompt_len:])) is not None:
+        out = self.call_masked(inp, sp, temp, Tensor(bias, dtype="float32")).realize()
+      else:
+        out = self(inp, sp, temp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue

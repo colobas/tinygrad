@@ -159,5 +159,35 @@ class TestTransformerGenerate(unittest.TestCase):
       next(gen)
     self.assertAlmostEqual(captured_temps[-1], 0.6, places=5)
 
+class TestConstrainedDecoding(unittest.TestCase):
+  def test_masked_generate_forces_conforming_json(self):
+    """A grammar mask threaded into the real decode graph forces output that conforms to the schema."""
+    import json
+    from tinygrad.llm.grammar import GrammarMasker
+    model = Transformer(TEST_CONFIG)  # vocab_size=100, random weights -> arbitrary logits
+    # synthetic char vocab; every token the grammar might need is present, eos is id 99
+    chars = ['{', '}', '"', ':', 'o', 'k', 't', 'r', 'u', 'e', 'f', 'a', 'l', 's']
+    token_texts = {i: c for i, c in enumerate(chars)}
+    eos = 99
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    masker = GrammarMasker(schema, token_texts, {eos}, vocab_size=100)
+
+    out_ids = []
+    for tid in model.generate([1, 2, 3], temperature=0.0, mask_fn=masker.mask):
+      if tid == eos: break
+      out_ids.append(tid)
+      self.assertIn(tid, token_texts, "model sampled a grammar-forbidden token")
+      if len(out_ids) > 50: self.fail("generation did not terminate")
+    text = "".join(token_texts[t] for t in out_ids)
+    self.assertIn(json.loads(text), ({"ok": True}, {"ok": False}))  # whichever boolean the weights favored
+
+  def test_unmasked_path_unchanged(self):
+    """Generation without mask_fn must be byte-identical to before (opt-in gate)."""
+    model = Transformer(TEST_CONFIG)
+    a = [t for _, t in zip(range(6), model.generate([1, 2, 3], temperature=0.0))]
+    model._cached_tokens = []
+    b = [t for _, t in zip(range(6), model.generate([1, 2, 3], temperature=0.0, mask_fn=None))]
+    self.assertEqual(a, b)
+
 if __name__ == '__main__':
   unittest.main()
