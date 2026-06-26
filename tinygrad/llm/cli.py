@@ -87,6 +87,27 @@ def _grammar_mask_fn(tok, schema:dict):
     ent = _TRIE_CACHE[id(texts)] = (texts, build_trie(texts))  # keep a ref to texts so its id can't be reused
   return GrammarMasker(schema, texts, eos_ids, vocab_size, trie=ent[1]).mask
 
+def _tools_system_text(tools:list[dict]) -> str:
+  # Hermes/Qwen tool-calling instruction injected into the system prompt when prompts are built from the
+  # preset fallback (the model's Jinja template, which would otherwise render `tools`, was unsupported).
+  # Tells the model to emit calls as <tool_call>{"name", "arguments"}</tool_call> — the format our parser reads.
+  sigs = "\n".join(json.dumps(t, separators=(",", ":")) for t in tools)
+  return ("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+          "You are provided with function signatures within <tools></tools> XML tags:\n"
+          f"<tools>\n{sigs}\n</tools>\n\n"
+          "For each function call, return a json object with function name and arguments within "
+          '<tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>')
+
+def _inject_tools_system(messages:list[dict], tools:list[dict]) -> list[dict]:
+  # fold the tool signatures into the first system message, or prepend a new system message.
+  text = _tools_system_text(tools)
+  out = [dict(m) for m in messages]
+  for m in out:
+    if m.get("role") == "system" and isinstance(m.get("content"), str):
+      m["content"] = (m["content"] + "\n\n" + text).strip()
+      return out
+  return [{"role":"system", "content":text}, *out]
+
 def _resolve_tools(body:dict) -> tuple[bool, str|None]:
   # validate the `tools`/`tool_choice` request shape and apply `tool_choice` semantics. Mutates
   # body["tools"] to the effective set rendered into the prompt (None to suppress). Returns
@@ -312,8 +333,10 @@ class Handler(HTTPRequestHandler):
   def _preset_ids(self, body) -> list[int]:
     # fallback prompt assembly from hardcoded per-preset role strings (last assistant message = prefill)
     tok = self.server.tok
+    # the template path renders `tools` itself; here (template unsupported) inject them into the system prompt
+    messages = _inject_tools_system(body["messages"], tools) if (tools := body.get("tools")) else body["messages"]
     ids: list[int] = tok.prefix()
-    for i, msg in enumerate(body["messages"]):
+    for i, msg in enumerate(messages):
       ids += tok.role(msg["role"])
       content = msg["content"]
       if isinstance(content, str): ids += tok.encode(content)
@@ -322,7 +345,7 @@ class Handler(HTTPRequestHandler):
           if c["type"] == "text": ids += tok.encode(c["text"])
           else: raise RuntimeError(f"unhandled type: {c['type']}")
       else: raise RuntimeError(f"unknown content type: {type(content)}")
-      if msg["role"] == "assistant" and i == len(body["messages"]) - 1: break
+      if msg["role"] == "assistant" and i == len(messages) - 1: break
       ids += tok.end_turn()
     else: ids += tok.role("assistant")
     return ids

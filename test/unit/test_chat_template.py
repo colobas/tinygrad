@@ -126,6 +126,44 @@ class TestTemplatePath(unittest.TestCase):
     fake = self._self(chat_template="{% macro f() %}{% endmacro %}")
     self.assertIsNone(Handler._template_ids(fake, {"messages": [{"role": "user", "content": "hi"}]}))
 
+WEATHER = {"type": "function", "function": {"name": "get_weather",
+           "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+
+class TestPresetToolInjection(unittest.TestCase):
+  """When the template is unsupported, the preset fallback must still put tool signatures in the prompt."""
+  def _preset_text(self, body):
+    from types import SimpleNamespace
+    from tinygrad.llm.cli import Handler
+    # fake tokenizer whose ids are just the utf-8 bytes of every emitted string, so we can read the prompt back
+    tok = SimpleNamespace(prefix=lambda: [], end_turn=lambda: [], encode=lambda s: list(s.encode()),
+                          role=lambda r: list(f"<{r}>".encode()))
+    return bytes(Handler._preset_ids(SimpleNamespace(server=SimpleNamespace(tok=tok)), body)).decode()
+
+  def test_tools_injected_into_preset_prompt(self):
+    text = self._preset_text({"messages": [{"role": "user", "content": "weather in SF?"}], "tools": [WEATHER]})
+    self.assertIn("<tools>", text)
+    self.assertIn("get_weather", text)                 # the signature reached the prompt
+    self.assertIn("<tool_call>", text)                 # and the model is told the call format our parser reads
+    self.assertIn("weather in SF?", text)              # original user message preserved
+
+  def test_tools_folded_into_existing_system_message(self):
+    text = self._preset_text({"messages": [{"role": "system", "content": "You are helpful."},
+                                           {"role": "user", "content": "hi"}], "tools": [WEATHER]})
+    self.assertEqual(text.count("<system>"), 1)        # folded into the existing system turn, not a second one
+    self.assertIn("You are helpful.", text)
+    self.assertIn("get_weather", text)
+
+  def test_no_tools_no_injection(self):
+    text = self._preset_text({"messages": [{"role": "user", "content": "hi"}]})
+    self.assertNotIn("<tools>", text)
+
+  def test_tools_system_text_serializes_each_tool(self):
+    from tinygrad.llm.cli import _tools_system_text
+    other = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+    txt = _tools_system_text([WEATHER, other])
+    self.assertIn("get_weather", txt)
+    self.assertIn("lookup", txt)
+
 @unittest.skipUnless(__import__("importlib").util.find_spec("jinja2"), "jinja2 not installed (golden reference)")
 class TestGoldenVsJinja2(unittest.TestCase):
   """Golden: rendered bytes match jinja2 — the engine transformers.apply_chat_template uses — configured
