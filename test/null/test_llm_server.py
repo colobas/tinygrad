@@ -441,6 +441,17 @@ class TestLLMServer(unittest.TestCase):
     self.assertEqual(resp.status_code, 400)
     self.assertEqual(resp.json()["error"]["type"], "invalid_request_error")
 
+  def test_handle_error_suppresses_client_disconnect(self):
+    # benign client hangups must not bubble out of handle_error (no traceback spam); real errors still do
+    for exc in (BrokenPipeError(), ConnectionResetError()):
+      try: raise exc
+      except type(exc): self.server.handle_error(None, ("127.0.0.1", 0))  # should return quietly
+    import io, contextlib
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+      try: raise ValueError("real bug")
+      except ValueError: self.server.handle_error(None, ("127.0.0.1", 0))
+    self.assertIn("real bug", err.getvalue())  # non-connection errors are still reported
+
   def test_models_endpoint(self):
     import requests as req
     resp = req.get(f"http://127.0.0.1:{self.port}/v1/models")

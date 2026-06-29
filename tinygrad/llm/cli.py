@@ -478,6 +478,11 @@ class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer):
     self.model, self.model_name, self.tok = model, model_name, tok
     super().__init__(server_address, Handler)
+  def handle_error(self, request, client_address):
+    # a client hanging up mid-response (the server is single-threaded, so e.g. a client's /v1/models poll
+    # times out and aborts while a generation is streaming) is not a server error — don't dump a traceback.
+    if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)): return
+    super().handle_error(request, client_address)
 
 def main():
   parser = argparse.ArgumentParser()
