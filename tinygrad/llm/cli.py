@@ -424,9 +424,18 @@ class Handler(HTTPRequestHandler):
       # json_schema: a fresh stateful grammar masker per request constrains decoding to a conforming value
       mask_fn = _grammar_mask_fn(self.server.tok, schema) if rf_mode == "json_schema" else None
       base_temp = float(body.get("temperature", 0.0))
+      # build the prompt once (template with tools, else preset); reject prompts that can't fit the context
+      # window with a clean 400 rather than crashing in generate()'s reshape.
+      ids = self.build_ids(body)
+      if len(ids) >= self.server.model.max_context:
+        self.send_data(json.dumps({"error": {
+          "message": f"prompt is {len(ids)} tokens but the model's context window is {self.server.model.max_context}; "
+                     f"restart the server with a larger --max_context", "type": "invalid_request_error",
+          "code": "context_length_exceeded"}}).encode(), status_code=400)
+        return
       def make_chunks(temperature, include_usage):
-        # build the prompt from the model's chat template (tools rendered in); fall back to preset roles
-        return self.run_model(self.build_ids(body), body["model"], include_usage, max_tokens=max_tokens, temperature=temperature,
+        # generate() mutates the token list, so hand each attempt its own copy
+        return self.run_model(list(ids), body["model"], include_usage, max_tokens=max_tokens, temperature=temperature,
                               stop=stop, reasoning=reasoning, tool_call=tool_call, tool_choice_name=tool_choice_name,
                               reasoning_budget=reasoning_budget, mask_fn=mask_fn)
 

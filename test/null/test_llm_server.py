@@ -26,6 +26,7 @@ class TestLLMServer(unittest.TestCase):
     cls.mock_model = Mock()
     cls.mock_model.generate = Mock(side_effect=lambda ids, **kwargs: iter([300, 301, 999]))
     cls.mock_model.get_start_pos = Mock(return_value=0)
+    cls.mock_model.max_context = 4096  # context-window guard compares against this
 
     from tinygrad.llm.cli import LLMServer
 
@@ -377,6 +378,17 @@ class TestLLMServer(unittest.TestCase):
                           "response_format": {"type": "json_object"}})
     self.assertEqual(resp.status_code, 502)
     self.assertEqual(resp.json()["error"]["type"], "json_validation_error")
+
+  def test_prompt_overflow_returns_400(self):
+    import requests as req
+    self.mock_model.max_context = 2  # tiny window so any real prompt overflows
+    try:
+      resp = req.post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                      json={"model": "test", "messages": [{"role": "user", "content": "hello there"}]})
+      self.assertEqual(resp.status_code, 400)
+      self.assertEqual(resp.json()["error"]["code"], "context_length_exceeded")
+    finally:
+      self.mock_model.max_context = 4096
 
   def test_invalid_response_format_returns_400(self):
     import requests as req
