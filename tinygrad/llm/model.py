@@ -1,9 +1,15 @@
 from __future__ import annotations
-import functools, itertools, pathlib
+import functools, itertools, pathlib, array
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad.dtype import dtypes
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
+
+def _f32_vocab(vals) -> Tensor:
+  # fast host->device for a vocab-length float vector: build raw f32 bytes and bitcast, avoiding the
+  # element-by-element Tensor(list) path (~100ms at 150k vocab vs ~3ms here) on the per-token decode loop.
+  return Tensor((vals if isinstance(vals, array.array) else array.array('f', vals)).tobytes()).bitcast(dtypes.float32)
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -441,7 +447,7 @@ class Transformer:
       rp, pp, fp = Tensor([rep_pen]), Tensor([presence_pen]), Tensor([freq_pen])
       zeros_bias = Tensor.zeros(self.vocab_size, dtype="float32").contiguous().realize()
       zeros_counts = Tensor.zeros(self.vocab_size, dtype="float32").contiguous().realize()
-      counts = [0.0] * self.vocab_size if penalize else None
+      counts = array.array('f', bytes(4 * self.vocab_size)) if penalize else None  # mutable f32 counts (in place)
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
@@ -455,8 +461,8 @@ class Transformer:
       # this call emits a sampled token iff it consumes the rest of the context; only those need mask/penalties
       if use_full and start_pos + nt_val >= len(tokens):
         bias = mask_fn(tokens[prompt_len:]) if mask_fn is not None else None
-        bias_t = Tensor(bias, dtype="float32") if bias is not None else zeros_bias
-        counts_t = Tensor(counts, dtype="float32") if penalize else zeros_counts
+        bias_t = _f32_vocab(bias) if bias is not None else zeros_bias
+        counts_t = _f32_vocab(counts) if penalize else zeros_counts
         out = self.call_full(inp, sp, temp, bias_t, counts_t, rp, pp, fp).realize()
       else:
         out = self(inp, sp, temp).realize()
