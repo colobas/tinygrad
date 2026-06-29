@@ -390,6 +390,26 @@ class TestLLMServer(unittest.TestCase):
     finally:
       self.mock_model.max_context = 4096
 
+  def test_penalties_threaded_to_generate(self):
+    captured = {}
+    def gen(ids, **kwargs):
+      captured.update(kwargs)
+      return iter([300, 301, 999])
+    self.mock_model.generate = Mock(side_effect=gen)
+    self.client.chat.completions.create(
+      model="test", messages=[{"role": "user", "content": "hi"}], stream=False,
+      extra_body={"repetition_penalty": 1.3, "presence_penalty": 1.5, "frequency_penalty": 0.2})
+    self.assertEqual(captured.get("rep_pen"), 1.3)
+    self.assertEqual(captured.get("presence_pen"), 1.5)
+    self.assertEqual(captured.get("freq_pen"), 0.2)
+
+  def test_invalid_repetition_penalty_returns_400(self):
+    import requests as req
+    resp = req.post(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                    json={"model": "test", "messages": [{"role": "user", "content": "hi"}], "repetition_penalty": 0})
+    self.assertEqual(resp.status_code, 400)
+    self.assertEqual(resp.json()["error"]["type"], "invalid_request_error")
+
   def test_invalid_response_format_returns_400(self):
     import requests as req
     resp = req.post(f"http://127.0.0.1:{self.port}/v1/chat/completions",

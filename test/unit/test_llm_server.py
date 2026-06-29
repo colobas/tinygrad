@@ -189,5 +189,39 @@ class TestConstrainedDecoding(unittest.TestCase):
     b = [t for _, t in zip(range(6), model.generate([1, 2, 3], temperature=0.0, mask_fn=None))]
     self.assertEqual(a, b)
 
+class TestSamplingPenalties(unittest.TestCase):
+  def setUp(self): self.m = Transformer(TEST_CONFIG)
+
+  def test_repetition_penalty_is_sign_dependent(self):
+    # seen tokens: positive logits divided by rep_pen, negative logits multiplied; unseen untouched
+    logits, counts = Tensor([[2.0, 1.0, -1.0]]), Tensor([1.0, 0.0, 1.0])
+    out = self.m._penalize(logits, counts, Tensor([2.0]), Tensor([0.0]), Tensor([0.0])).tolist()[0]
+    self.assertAlmostEqual(out[0], 1.0, places=4)   # 2.0 / 2 (seen, positive)
+    self.assertAlmostEqual(out[1], 1.0, places=4)   # unseen, unchanged
+    self.assertAlmostEqual(out[2], -2.0, places=4)  # -1.0 * 2 (seen, negative)
+
+  def test_presence_and_frequency_are_additive(self):
+    logits, counts = Tensor([[2.0, 2.0, 2.0]]), Tensor([0.0, 1.0, 3.0])
+    out = self.m._penalize(logits, counts, Tensor([1.0]), Tensor([0.5]), Tensor([0.1])).tolist()[0]
+    self.assertAlmostEqual(out[0], 2.0, places=4)   # unseen
+    self.assertAlmostEqual(out[1], 1.4, places=4)   # 2 - 0.5(presence) - 0.1(freq*1)
+    self.assertAlmostEqual(out[2], 1.2, places=4)   # 2 - 0.5(presence) - 0.3(freq*3)
+
+  def test_neutral_penalties_are_identity(self):
+    logits, counts = Tensor([[2.0, -1.0, 0.5]]), Tensor([5.0, 5.0, 5.0])  # all seen, but neutral params
+    out = self.m._penalize(logits, counts, Tensor([1.0]), Tensor([0.0]), Tensor([0.0])).tolist()[0]
+    self.assertEqual([round(x, 4) for x in out], [2.0, -1.0, 0.5])
+
+  def test_penalty_changes_decode_end_to_end(self):
+    # fixed logits (token 0 highest) -> greedy repeats token 0; a presence penalty bigger than the 0-vs-1 gap
+    # must push the second pick to token 1, proving counts accumulate and feed the sampler through the JIT.
+    fixed = Tensor([[10.0, 9.0] + [0.0] * (TEST_CONFIG.vocab_size - 2)])
+    self.m._logits = lambda tokens, start_pos: fixed
+    base = [t for _, t in zip(range(3), self.m.generate([1, 2, 3], temperature=0.0))]
+    self.m._cached_tokens = []
+    pen = [t for _, t in zip(range(3), self.m.generate([1, 2, 3], temperature=0.0, presence_pen=5.0))]
+    self.assertEqual(base, [0, 0, 0])      # greedy loops on the highest-logit token
+    self.assertEqual(pen[:2], [0, 1])      # after token 0 is penalized (10-5 < 9), token 1 wins
+
 if __name__ == '__main__':
   unittest.main()

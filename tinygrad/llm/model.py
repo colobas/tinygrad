@@ -303,16 +303,17 @@ class Transformer:
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-    self.max_context = config.max_context
+    self.max_context, self.vocab_size = config.max_context, config.vocab_size
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
-    # constrained decoding (§7): separate JITs that add a per-token logit bias before sampling. Kept apart
-    # from the unmasked JITs above so the default decode path is byte-identical and pays nothing (opt-in).
-    self.masked_prefill_jit = TinyJit(self.forward_masked)
-    self.masked_rollout_jit = TinyJit(self.forward_masked)
+    # augmented decode (§7 grammar mask + sampling penalties): separate JITs that take a per-token logit bias
+    # and a generated-token `counts` buffer before sampling. Kept apart from the plain JITs above so the
+    # default decode path is byte-identical and pays nothing (opt-in); neutral inputs make it equal to forward.
+    self.full_prefill_jit = TinyJit(self.forward_full)
+    self.full_rollout_jit = TinyJit(self.forward_full)
 
   def _logits(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
@@ -323,20 +324,31 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+  def _penalize(self, logits:Tensor, counts:Tensor, rep_pen:Tensor, presence:Tensor, frequency:Tensor) -> Tensor:
+    # apply OpenAI/HF generation penalties from `counts` (times each token was emitted). repetition_penalty is
+    # sign-dependent (divide positive logits, multiply negative), so it runs here rather than as a host bias;
+    # presence/frequency are additive. Neutral values (rep_pen=1, presence=0, frequency=0) leave logits intact.
+    seen = counts > 0
+    logits = seen.where((logits > 0).where(logits / rep_pen, logits * rep_pen), logits)
+    return logits - presence * seen.float() - frequency * counts
+
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return self._sample(self._logits(tokens, start_pos), temperature)
 
-  def forward_masked(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor) -> Tensor:
-    # logit_bias is additive: 0.0 for grammar-permitted tokens, a large negative for forbidden ones, so the
-    # argmax can only land on a permitted token. The bias is a graph input, so no recompile per step.
-    return self._sample(self._logits(tokens, start_pos) + logit_bias, temperature)
+  def forward_full(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor, counts:Tensor,
+                   rep_pen:Tensor, presence:Tensor, frequency:Tensor) -> Tensor:
+    # logit_bias is additive (0.0 allowed, large-negative forbidden for the grammar mask); counts/penalties
+    # discourage repetition. All are graph inputs, so there's no recompile per step.
+    logits = self._penalize(self._logits(tokens, start_pos), counts, rep_pen, presence, frequency)
+    return self._sample(logits + logit_bias, temperature)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
-  def call_masked(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor) -> Tensor:
-    jit = self.masked_prefill_jit if resolve(tokens.shape[1] != 1) else self.masked_rollout_jit
-    return jit(tokens.contiguous(), start_pos, temperature, logit_bias)
+  def call_full(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor, counts:Tensor,
+                rep_pen:Tensor, presence:Tensor, frequency:Tensor) -> Tensor:
+    jit = self.full_prefill_jit if resolve(tokens.shape[1] != 1) else self.full_rollout_jit
+    return jit(tokens.contiguous(), start_pos, temperature, logit_bias, counts, rep_pen, presence, frequency)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -411,15 +423,25 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mask_fn=None):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mask_fn=None,
+               rep_pen:float=1.0, presence_pen:float=0.0, freq_pen:float=0.0):
     # mask_fn (optional, §7) is given the completion-so-far token ids and returns a vocab-length additive
     # logit bias (0 = allowed, large-negative = forbidden) for the next token, or None to leave it unmasked.
-    # When mask_fn is None the unmasked decode path runs unchanged.
+    # rep_pen/presence_pen/freq_pen (optional) apply generation penalties over the completion's token counts.
+    # When none are active the plain decode path runs unchanged.
     if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
+    # opt-in augmented path: only build the penalty/mask inputs (and use the heavier JIT) when actually needed
+    penalize = rep_pen != 1.0 or presence_pen != 0.0 or freq_pen != 0.0
+    use_full = mask_fn is not None or penalize
+    if use_full:
+      rp, pp, fp = Tensor([rep_pen]), Tensor([presence_pen]), Tensor([freq_pen])
+      zeros_bias = Tensor.zeros(self.vocab_size, dtype="float32").contiguous().realize()
+      zeros_counts = Tensor.zeros(self.vocab_size, dtype="float32").contiguous().realize()
+      counts = [0.0] * self.vocab_size if penalize else None
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
@@ -430,14 +452,18 @@ class Transformer:
       nt_val = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(nt_val)
       inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
-      # this call emits a sampled token iff it consumes the rest of the context; only those need masking
-      if mask_fn is not None and start_pos + nt_val >= len(tokens) and (bias := mask_fn(tokens[prompt_len:])) is not None:
-        out = self.call_masked(inp, sp, temp, Tensor(bias, dtype="float32")).realize()
+      # this call emits a sampled token iff it consumes the rest of the context; only those need mask/penalties
+      if use_full and start_pos + nt_val >= len(tokens):
+        bias = mask_fn(tokens[prompt_len:]) if mask_fn is not None else None
+        bias_t = Tensor(bias, dtype="float32") if bias is not None else zeros_bias
+        counts_t = Tensor(counts, dtype="float32") if penalize else zeros_counts
+        out = self.call_full(inp, sp, temp, bias_t, counts_t, rp, pp, fp).realize()
       else:
         out = self(inp, sp, temp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
+      if penalize: counts[tokens[-1]] += 1.0  # only the generated completion is penalized, not the prompt
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]

@@ -108,6 +108,15 @@ def _inject_tools_system(messages:list[dict], tools:list[dict]) -> list[dict]:
       return out
   return [{"role":"system", "content":text}, *out]
 
+def _resolve_penalties(body:dict) -> tuple[float, float, float]:
+  # generation penalties applied in the sampler (repetition_penalty divides/multiplies by sign, presence and
+  # frequency are additive over the completion's token counts). Raises ValueError (-> HTTP 400) on bad values.
+  try: rep, pres, freq = float(body.get("repetition_penalty", 1.0)), float(body.get("presence_penalty", 0.0)), \
+    float(body.get("frequency_penalty", 0.0))
+  except (TypeError, ValueError): raise ValueError("penalty parameters must be numbers")
+  if rep <= 0: raise ValueError("repetition_penalty must be > 0")
+  return rep, pres, freq
+
 def _resolve_tools(body:dict) -> tuple[bool, str|None]:
   # validate the `tools`/`tool_choice` request shape and apply `tool_choice` semantics. Mutates
   # body["tools"] to the effective set rendered into the prompt (None to suppress). Returns
@@ -267,7 +276,8 @@ class Handler(HTTPRequestHandler):
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
                 stop:list[str]|None=None, reasoning:tuple[str,str]|None=None, tool_call:tuple[str,str]|None=None,
-                tool_choice_name:str|None=None, reasoning_budget:int|None=None, mask_fn=None):
+                tool_choice_name:str|None=None, reasoning_budget:int|None=None, mask_fn=None,
+                rep_pen:float=1.0, presence_pen:float=0.0, freq_pen:float=0.0):
     model, tok = self.server.model, self.server.tok
     cache_start_pos = model.get_start_pos(ids)
     stderr_log(f"{self.path}  {colored('--', 'BLACK')}  "
@@ -304,7 +314,8 @@ class Handler(HTTPRequestHandler):
     pt, gen_ids, reasoning_count, injected, done = st, ids, 0, False, False
     while not done:
       done = True
-      for next_id in model.generate(gen_ids, temperature=temperature, mask_fn=mask_fn):
+      for next_id in model.generate(gen_ids, temperature=temperature, mask_fn=mask_fn,
+                                     rep_pen=rep_pen, presence_pen=presence_pen, freq_pen=freq_pen):
         if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
         out.append(next_id)
@@ -413,6 +424,7 @@ class Handler(HTTPRequestHandler):
         enable_tools, tool_choice_name = _resolve_tools(body)  # validate shape + honor tool_choice (mutates body["tools"])
         reasoning, reasoning_budget = _resolve_reasoning(body, self.server.tok)  # markers + host-side think budget
         rf_mode, schema = _resolve_response_format(body)  # json_object: guide+retry; json_schema: constrained decode
+        rep_pen, presence_pen, freq_pen = _resolve_penalties(body)  # sampler penalties
       except ValueError as e:
         self.send_data(json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}).encode(), status_code=400)
         return
@@ -437,7 +449,8 @@ class Handler(HTTPRequestHandler):
         # generate() mutates the token list, so hand each attempt its own copy
         return self.run_model(list(ids), body["model"], include_usage, max_tokens=max_tokens, temperature=temperature,
                               stop=stop, reasoning=reasoning, tool_call=tool_call, tool_choice_name=tool_choice_name,
-                              reasoning_budget=reasoning_budget, mask_fn=mask_fn)
+                              reasoning_budget=reasoning_budget, mask_fn=mask_fn,
+                              rep_pen=rep_pen, presence_pen=presence_pen, freq_pen=freq_pen)
 
       if rf_mode == "json_object":
         # buffer + validate + retry (6.2). Greedy first; later attempts vary temperature so they can differ.
