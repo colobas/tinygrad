@@ -1,9 +1,8 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
-from tinygrad.dtype import PtrDType
 from tinygrad.uop.ops import Ops, resolve, AxisType
-from tinygrad.codegen.late.devectorizer import image_valid_dims
+from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
@@ -51,10 +50,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
     for buf_index,buf in enumerate(k.bufs):
-      if isinstance(buf.src[0].dtype, PtrDType) and image_valid_dims(buf.src[0].dtype.base, buf.src[0].dtype.size, k.ren.target.arch):
-        # part of is_expanded
-        unit_stride_axes_mul_4 = [k.rngs.index(c) for c in k.bufs[buf_index].src[1].get_idx().split_uop(Ops.ADD) if
-          c.op is Ops.RANGE and (c.vmax+1)%4 == 0]
+      if image_valid_dims(buf.src[0].dtype, buf.src[0].max_numel(), k.ren.target.arch):
+        idx = k.bufs[buf_index].src[1]
+        # IMAGE upcasts require one validity shared by all four unit-stride lanes so memory_coalescing can combine them into one vector read.
+        unit_stride_axes_mul_4 = [k.rngs.index(c) for c in idx.get_idx().split_uop(Ops.ADD) if
+          c.op is Ops.RANGE and (c.vmax+1)%4 == 0 and c not in idx.get_valid().backward_slice]
         if len(unit_stride_axes_mul_4):
           if (axis:=unit_stride_axes_mul_4[0]) in k.upcastable_dims:
             k.apply_opt(Opt(OptOps.UPCAST, axis, 4))
@@ -169,7 +169,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     else:
       # prioritize making expand axes local
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
-                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.LOOP) if k.rngs[axis].src[0].op is Ops.CONST]
+                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK) if k.rngs[axis].src[0].op is Ops.CONST]
       to_local: list[tuple[int, int]] = []
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
@@ -188,7 +188,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     for threads in [32,16,12,8,6,5,4,3,2]:
       # Skip if too many threads. Heuristic: use about 128K ops per thread
       if threads > k.ren.global_max[0] or resolve(prod(k.full_shape) // (128 << 10) < threads): continue
-      for axis in k.axes_of(AxisType.LOOP):
+      for axis in k.axes_of(AxisType.WEAK):
         if k.full_shape[axis] % threads == 0:
           try: k.apply_opt(Opt(OptOps.THREAD, axis, threads))
           except KernelOptError: pass

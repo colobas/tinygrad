@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib
+import sys, argparse, codecs, itertools, typing, re, unicodedata, json, uuid, time, pathlib
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker, getenv
@@ -154,8 +154,12 @@ class SimpleTokenizer:
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
 
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L286
-    # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
-    def ucat_range(pre: str): return "".join(re.escape(chr(cp)) for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
+    # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L).
+    # Compact adjacent codepoints into ranges: listing them all makes re spend seconds on large prompts.
+    def ucat_range(pre:str) -> str:
+      cps = enumerate(cp for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
+      runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
+      return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
     self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
       f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
@@ -246,6 +250,130 @@ class SimpleTokenizer:
     return ([] if self.bos_id is None else [self.bos_id]) + (self.encode("<sop>") if self.preset == 'glm4' else [])
   def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
 
+class FallbackTemplate:
+  # String-rendering fallback compatible with the upstream template interface.
+  def __init__(self, tok:SimpleTokenizer): self.tok = tok
+  def role(self, role:str) -> str:
+    if self.tok.preset == 'olmo': return f"<|{role}|>\n"
+    if self.tok.preset == 'kimi-k2': return f"<|im_{role}|>{role}<|im_middle|>"
+    if self.tok.preset == 'qwen2': return f"<|im_start|>{role}\n"
+    if self.tok.preset == 'glm4': return f"<|{role}|>"
+    if self.tok.preset == 'tekken':
+      if role == 'user': return "[INST]"
+      if role == 'assistant': return ""
+      raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
+    return f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+  def end_turn(self) -> str:
+    if self.tok.preset == 'olmo': return "\n"
+    if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
+    if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
+    if self.tok.preset == 'glm4': return ""
+    if self.tok.preset == 'tekken': return "[/INST]"
+    return self.tok.decode([self.tok.eos_id])
+  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True) -> str:
+    out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
+    for msg in messages:
+      out += self.role(msg["role"])
+      content = msg.get("content")
+      if isinstance(content, str): out += content
+      elif isinstance(content, list):
+        for c in content:
+          if c["type"] == "text": out += c["text"]
+          else: raise RuntimeError(f"unhandled type: {c['type']}")
+      elif content is not None: raise RuntimeError(f"unknown content type: {type(content)}")
+      out += self.end_turn()
+    return out + self.role("assistant") if add_generation_prompt else out
+
+class GemmaTokenizer:
+  # Gemma-4 (`tokenizer.ggml.model == "gemma4"`) is a SentencePiece-style BPE, not the GPT-2/llama3 byte-level
+  # BPE that SimpleTokenizer implements: the normalizer maps space->U+2581, there is no real pre-tokenization
+  # (the whole normalized string is BPE'd as one unit), unknown bytes fall back to `<0xXX>` tokens, and `ignore_merges`
+  # keeps a piece that is itself a vocab token from being split. Validated id-for-id against HF `tokenizers`
+  # (tokenizer.json) on a 200-string fuzz set + special-token boundaries. Exposes the SimpleTokenizer interface.
+  def __init__(self, tokens:list[str], token_types:list[int], merges:list[str], bos_id:int|None, eos_id:int,
+               eot_id:int|None=None, chat_template:str|None=None):
+    self._tokens = tokens
+    self._vocab = {t: i for i, t in enumerate(tokens)}
+    self._merge_rank = {(m[:s], m[s+1:]): r for r, m in ((r, m) for r, m in enumerate(merges)) if (s := m.find(' ')) != -1}
+    self._byte_tok = {b: self._vocab.get(f"<0x{b:02X}>") for b in range(256)}
+    # decode map: BYTE tokens (type 6) -> the raw byte; everything else -> its text with U+2581 restored to space
+    self._tok2bytes = {i: (bytes([int(t[3:5], 16)]) if tt == 6 and len(t) == 6 else t.replace('▁', ' ').encode('utf-8'))
+                       for i, (t, tt) in enumerate(zip(tokens, token_types))}
+    # special (CONTROL/USER_DEFINED) tokens are matched whole, longest-first, before BPE
+    self._specials = {t for t, tt in zip(tokens, token_types) if tt in (3, 4)}
+    self._special_re = re.compile("|".join(re.escape(s) for s in sorted(self._specials, key=len, reverse=True)) or r"(?!)")
+    self.preset = "gemma4"
+    self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
+    self.chat_template = chat_template
+    self.bos_token = tokens[bos_id] if bos_id is not None else ""
+    self.eos_token = tokens[eos_id] if eos_id is not None else ""
+    self.reasoning_format = detect_reasoning_format(chat_template, self._specials)
+
+  @staticmethod
+  def from_gguf_kv(kv:dict):
+    toks = kv["tokenizer.ggml.tokens"]
+    bos_id = kv.get('tokenizer.ggml.bos_token_id')
+    eos_id = kv.get('tokenizer.ggml.eos_token_id', 0)
+    # gemma chat turns end with <turn|> (id 106); treat it as an end-of-turn id alongside <eos>
+    eot_id = kv.get('tokenizer.ggml.eot_token_id', toks.index('<turn|>') if '<turn|>' in toks else None)
+    return GemmaTokenizer(toks, kv["tokenizer.ggml.token_type"], kv.get("tokenizer.ggml.merges", []),
+      bos_id=bos_id if kv.get('tokenizer.ggml.add_bos_token', True) else None,
+      eos_id=eos_id, eot_id=eot_id, chat_template=kv.get('tokenizer.chat_template'))
+
+  def _bpe(self, word:str) -> list[str]:
+    if word in self._vocab: return [word]   # ignore_merges: a whole-word vocab hit is not split
+    syms = list(word)
+    while len(syms) > 1:
+      best, bi = None, -1
+      for i in range(len(syms)-1):
+        if (r := self._merge_rank.get((syms[i], syms[i+1]))) is not None and (best is None or r < best): best, bi = r, i
+      if bi == -1: break
+      syms[bi:bi+2] = [syms[bi] + syms[bi+1]]
+    return syms
+
+  def _encode_chunk(self, text:str) -> list[int]:
+    ids: list[int] = []
+    for piece in self._bpe(text.replace(' ', '▁')):   # normalizer: space -> U+2581
+      if (tid := self._vocab.get(piece)) is not None: ids.append(tid)
+      else: ids += [self._byte_tok[b] for b in piece.encode('utf-8')]   # byte fallback
+    return ids
+
+  def encode(self, text:str) -> list[int]:
+    ids: list[int] = []
+    pos = 0
+    for m in self._special_re.finditer(text):
+      if m.start() > pos: ids += self._encode_chunk(text[pos:m.start()])
+      ids.append(self._vocab[m.group(0)])
+      pos = m.end()
+    return ids + (self._encode_chunk(text[pos:]) if pos < len(text) else [])
+
+  def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[t] for t in ids).decode(errors='replace')
+  def stream_decoder(self) -> typing.Callable[..., str]:
+    dec = codecs.getincrementaldecoder('utf-8')('replace')
+    def _decode(tid:int|None=None) -> str: return dec.decode(self._tok2bytes[tid]) if tid is not None else dec.decode(b'', final=True)
+    return _decode
+
+  def grammar_vocab(self) -> tuple[dict[int, str], set[int], int]:
+    if (cached := getattr(self, "_grammar_vocab_cache", None)) is not None: return cached
+    texts: dict[int, str] = {}
+    for tid, b in self._tok2bytes.items():
+      if self._tokens[tid] in self._specials: continue
+      try: texts[tid] = b.decode("utf-8")
+      except UnicodeDecodeError: continue
+    self._grammar_vocab_cache = (texts, {i for i in (self.eos_id, self.eot_id) if i is not None}, len(self._tokens))
+    return self._grammar_vocab_cache
+
+  # gemma chat format: `<|turn>{role}\n ... <turn|>\n`, assistant rendered as `model` (matches the GGUF template)
+  def role(self, role:str): return self.encode(f"<|turn>{'model' if role == 'assistant' else role}\n")
+  def end_turn(self): return self.encode("<turn|>\n")
+  def prefix(self) -> list[int]: return [] if self.bos_id is None else [self.bos_id]
+  def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
+
+def tokenizer_from_gguf_kv(kv:dict):
+  # dispatch by tokenizer model: gemma4 is SentencePiece BPE, the rest are GPT-2/llama3 byte-level BPE
+  if kv.get("tokenizer.ggml.model") == "gemma4": return GemmaTokenizer.from_gguf_kv(kv)
+  return SimpleTokenizer.from_gguf_kv(kv)
+
 models = {
   "llama3.2:1b": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
   "llama3.2:1b-q4": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
@@ -259,8 +387,8 @@ models = {
   "qwen3.5:0.8b": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf",
   "qwen3.5:4b": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
   "qwen3.5:9b": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
-  "qwen3.5:27b": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf",
-  "qwen3.5:35b-a3b": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf",
+  "qwen3.6:27b": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
+  "qwen3.6:35b-a3b": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "moonlight": "https://huggingface.co/gabriellarson/Moonlight-16B-A3B-Instruct-GGUF/resolve/main/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
   "glm-4.7-flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
@@ -501,8 +629,8 @@ def main():
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
 
-  # get tokenizer
-  tok = SimpleTokenizer.from_gguf_kv(kv)
+  # get tokenizer (gemma4 -> SentencePiece GemmaTokenizer, otherwise byte-level SimpleTokenizer)
+  tok = tokenizer_from_gguf_kv(kv)
 
   # warmup the JIT
   if args.warmup or args.serve:

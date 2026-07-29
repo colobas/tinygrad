@@ -246,6 +246,24 @@ class TestFunction(unittest.TestCase):
     r0 = f(buf, x, v.bind(0)).numpy()
     np.testing.assert_equal(r0, [[1.,0.,0.,0.,0.,0.,0.,0.], [2.,0.,0.,0.,0.,0.,0.,0.]])
 
+  def test_single_after_store_precompile(self):
+    """precompiled AFTER(buf, STORE(view, data)) should return buf after the store."""
+    @function(precompile=True)
+    def f(buf:Tensor, x:Tensor, start_pos:int|UOp) -> Tensor:
+      slice_uop = buf[:, start_pos:start_pos+1].uop
+      assigned = Tensor(buf.uop.after(slice_uop.store(x.uop)))
+      return assigned
+
+    x = Tensor([[1.], [2.]]).realize()
+    v = UOp.variable("sp", 0, 7)
+    for sp in (0, 2):
+      with self.subTest(sp=sp):
+        buf = Tensor.zeros(2, 8).clone().realize()
+        expected = np.zeros((2, 8), dtype=np.float32)
+        expected[:, sp] = [1., 2.]
+        np.testing.assert_equal(f(buf, x, v.bind(sp)).numpy(), expected)
+        np.testing.assert_equal(buf.numpy(), expected)
+
   @unittest.expectedFailure
   def test_assign_slice(self):
     @function
@@ -517,7 +535,7 @@ class TestFunctionTuple(unittest.TestCase):
 
     @function(precompile=True, precompile_backward=True)
     def f(a:Tensor):
-      c = Tensor(Tensor.invalids(a.shape[0]//len(devs), a.shape[1], dtype=a.dtype, device=devs).uop.multi(0), device=devs)
+      c = Tensor(Tensor.invalids(a.shape[0]//len(devs), a.shape[1], dtype=a.dtype, device=devs).uop.unshard(0), device=devs)
       return Tensor.custom_kernel(c, a, fxn=double_kernel, grad_fxn=double_grad)[0]
 
     np.testing.assert_allclose(f(a).numpy(), 14.0)
@@ -525,7 +543,7 @@ class TestFunctionTuple(unittest.TestCase):
     # g is f with empty output instead of invalids
     @function(precompile=True, allow_implicit=True)
     def g(a:Tensor):
-      c = Tensor(Tensor.empty(a.shape[0]//len(devs), a.shape[1], dtype=a.dtype, device=devs).uop.multi(0), device=devs)
+      c = Tensor(Tensor.empty(a.shape[0]//len(devs), a.shape[1], dtype=a.dtype, device=devs).uop.unshard(0), device=devs)
       return Tensor.custom_kernel(c, a, fxn=double_kernel, grad_fxn=double_grad)[0]
 
     np.testing.assert_allclose(g(a).numpy(), 14.0)
@@ -557,7 +575,7 @@ class TestFunctionTuple(unittest.TestCase):
     lib = Device["CPU"].compiler.compile(src)
     def prog(C:UOp, A:UOp) -> UOp:
       sink = UOp.sink(C.base, A.base, arg=KernelInfo(name="k"))
-      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="CPU"), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)),
                                    UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)),
                  arg=ProgramInfo(name="k", global_size=(1, 1, 1), local_size=(1, 1, 1), globals=(0, 1)))
 
@@ -590,7 +608,7 @@ class TestFunctionTuple(unittest.TestCase):
     @function(precompile=True)
     def f(a:Tensor):
       c = Tensor.invalids(*a.uop.shard_shape, dtype=a.dtype, device=a.device)
-      if multi: c = Tensor(c.uop.multi(a.uop.axis), device=a.device)
+      if multi: c = Tensor(c.uop.unshard(a.uop.axis), device=a.device)
       c = Tensor.custom_kernel(c, a, fxn=my_kernel)[0]
       return c + 1
 

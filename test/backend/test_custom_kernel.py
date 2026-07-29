@@ -7,12 +7,12 @@ from tinygrad.uop.ops import KernelInfo, AxisType, Ops
 
 def custom_arange_kernel(C:UOp) -> UOp:
   i = UOp.range(C.shape[0], 0)
-  return C[i].store(i.cast(C.dtype.base)).end(i).sink(arg=KernelInfo(name=f"custom_arange_{C.shape[0]}"))
+  return C[i].store(i.cast(C.dtype)).end(i).sink(arg=KernelInfo(name=f"custom_arange_{C.shape[0]}"))
 
 def custom_eye_kernel(C:UOp) -> UOp:
   i = UOp.range(C.shape[0], 0)
   j = UOp.range(C.shape[1], 1)
-  return C[i, j].store((i.eq(j)).cast(C.dtype.base)).end(i, j).sink(arg=KernelInfo(name=f"custom_eye_{C.numel()}"))
+  return C[i, j].store((i.eq(j)).cast(C.dtype)).end(i, j).sink(arg=KernelInfo(name=f"custom_eye_{C.numel()}"))
 
 def custom_add_one_kernel(B:UOp, A:UOp) -> UOp:
   A,B = A.flatten(), B.flatten()
@@ -51,13 +51,13 @@ def flip_contract_kernel(dest:UOp, src:UOp):
   i = UOp.range(dest.shape[0], 0)
   j = UOp.range(dest.shape[1], 1, AxisType.UPCAST)
   vec = src[i, j].contract(j)
-  store = UOp.group(*[dest[i, k].store(vec.gep(3-k)) for k in range(4)])
+  store = UOp.group(*[dest[i, k].store(vec.index(3-k)) for k in range(4)])
   return store.end(i, j).sink(arg=KernelInfo(name=f"flip_contract_{dest.numel()}", opts_to_apply=()))
 
 def slice_sum_kernel(dest:UOp, src:UOp):
-  G = UOp.range(src.shape[0], 0)
+  G = UOp.range(src.shape[0], 0, dtype=dtypes.int)
   slice_src = src[G, :]
-  reg = UOp.placeholder((1,), dest.dtype.base, 0, addrspace=AddrSpace.REG)
+  reg = UOp.placeholder((1,), dest.dtype, 0, addrspace=AddrSpace.REG)
   reg = reg.after(G)[0].set(0)
   R = UOp.range(src.shape[1], 1, AxisType.REDUCE)
   reg = reg[0].set(reg.after(R)[0] + slice_src[R], end=R)
@@ -73,12 +73,12 @@ def simple_qkv_kernel(O:UOp, Q:UOp, K:UOp, V:UOp) -> UOp:
   j = UOp.range(N, 2, axis_type=AxisType.REDUCE)
 
   k_inner = UOp.range(d, 3, axis_type=AxisType.REDUCE)
-  qk_acc = UOp.placeholder((1,), Q.dtype.base, 0, addrspace=AddrSpace.REG)
+  qk_acc = UOp.placeholder((1,), Q.dtype, 0, addrspace=AddrSpace.REG)
   qk_acc = qk_acc.after(i, j)[0].set(0.0)
   qk_acc = qk_acc[0].set(qk_acc.after(k_inner)[0] + Q[i, k_inner] * K[j, k_inner], end=k_inner)
   qk_score = qk_acc[0] / (d ** 0.5)
 
-  out_acc = UOp.placeholder((1,), Q.dtype.base, 1, addrspace=AddrSpace.REG)
+  out_acc = UOp.placeholder((1,), Q.dtype, 1, addrspace=AddrSpace.REG)
   out_acc = out_acc.after(i, d_out)[0].set(0.0)
   out_acc = out_acc[0].set(out_acc.after(j)[0] + qk_score * V[j, d_out], end=j)
 
@@ -117,13 +117,20 @@ class TestCustomKernel(unittest.TestCase):
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
 
+  def test_duplicate_call_arg(self):
+    x = Tensor.arange(4).clone().realize()
+    x = Tensor.custom_kernel(x, x, fxn=custom_add_one_kernel)[0]
+    # webgpu silently errors when a kernel has duplicate buffer args, so the list stays the same.
+    # https://gpuweb.github.io/gpuweb/#abstract-opdef-encoder-bind-groups-alias-a-writable-resource
+    self.assertEqual(x.tolist(), [1, 2, 3, 4] if Device.DEFAULT != "WEBGPU" else [0, 1, 2, 3])
+
   def test_simple_sharded(self):
     devs = ("CPU:0", "CPU:1")
 
     a = Tensor.ones(16, 16).contiguous().shard(devs, axis=0)
     b = Tensor.ones(16, 16).contiguous().shard(devs, axis=0)
     # ugly construction to get a sharded empty tensor
-    c = Tensor(Tensor.empty(8, 16, device=devs).uop.multi(0), device=devs)
+    c = Tensor(Tensor.empty(8, 16, device=devs).uop.unshard(0), device=devs)
     c = Tensor.custom_kernel(c,a,b, fxn=custom_elementwise_add_kernel)[0]
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
@@ -132,7 +139,7 @@ class TestCustomKernel(unittest.TestCase):
     # PYTHON backend explicitly checks for OOB access for wrong multi shape regression
     devs = ("PYTHON:0", "PYTHON:1")
     a = Tensor.ones(4, 4).contiguous().shard(devs, axis=0)
-    c = Tensor(Tensor.empty(2, 4, device=devs).uop.multi(0), device=devs)
+    c = Tensor(Tensor.empty(2, 4, device=devs).uop.unshard(0), device=devs)
     c = Tensor.custom_kernel(c, a, fxn=custom_add_one_kernel)[0]
     assert (c == 2).all().item()
 
@@ -199,18 +206,16 @@ class TestCustomKernel(unittest.TestCase):
     c = Tensor.empty(N, N)
 
     tst = Tensor.custom_kernel(c, a, b, fxn=custom_gemm)[0]
-    err = (tst - (a@b)).square().max()
-    self.assertLess(err.item(), 1e-6)
+    self.assertTrue(tst.allclose(a@b, atol=1e-3).item())
 
   def test_gemm_multi(self):
     devs = ("CPU:0", "CPU:1")
     N = 16
     a = Tensor.randn(N, N).shard_(devs, axis=0)
     b = Tensor.randn(N, N).to(devs)
-    c = Tensor(Tensor.empty(N//2, N, device=devs).uop.multi(0), device=devs)
+    c = Tensor(Tensor.empty(N//2, N, device=devs).uop.unshard(0), device=devs)
     tst = Tensor.custom_kernel(c, a, b, fxn=custom_gemm)[0]
-    err = (tst - (a@b)).square().max()
-    self.assertLess(err.item(), 1e-6)
+    self.assertTrue(tst.allclose(a@b, atol=1e-3).item())
 
   def test_gemm_backward_custom(self): self.test_gemm_backward(True)
   # NOTE: grad_fxn doesn't work with pyrender
@@ -233,14 +238,9 @@ class TestCustomKernel(unittest.TestCase):
     real_grad_a, real_grad_b = a.grad, b.grad
     Tensor.realize(ref, real_grad_a, real_grad_b)
 
-    err = (tst - ref).square().max()
-    self.assertLess(err.item(), 1e-6)
-
-    err = (grad_a - real_grad_a).square().max()
-    self.assertLess(err.item(), 1e-6)
-
-    err = (grad_b - real_grad_b).square().max()
-    self.assertLess(err.item(), 1e-6)
+    self.assertTrue(tst.allclose(ref, atol=1e-3).item())
+    self.assertTrue(grad_a.allclose(real_grad_a, atol=1e-3).item())
+    self.assertTrue(grad_b.allclose(real_grad_b, atol=1e-3).item())
 
   def test_simple_qkv(self):
     N, d = 8, 4
@@ -253,8 +253,7 @@ class TestCustomKernel(unittest.TestCase):
     O_ref = ((Q @ K.T) / (d ** 0.5)) @ V
 
     Tensor.realize(O_custom, O_ref)
-    err = (O_custom - O_ref).square().max()
-    self.assertLess(err.item(), 1e-6)
+    self.assertTrue(O_custom.allclose(O_ref, atol=1e-3).item())
 
   def test_gemm_qkv(self):
     B, N, K_DIM, H_KV, REP, D = 2, 7, 6, 2, 2, 6
@@ -331,7 +330,7 @@ class TestCustomKernel(unittest.TestCase):
   def test_multi_invalids_custom_kernel_no_copy(self):
     devs = ("CPU:0", "CPU:1")
     a = Tensor.ones(4, 4).shard(devs, axis=0).realize()
-    c = Tensor(UOp.const(dtypes.float, Invalid, shape=(2, 4)).clone(device=devs).multi(0), device=devs)
+    c = Tensor(Tensor.invalids(2, 4, dtype=dtypes.float, device=devs).uop.unshard(0), device=devs)
     c = Tensor.custom_kernel(c, a, fxn=custom_add_one_kernel)[0]
     GlobalCounters.reset()
     c.realize()
@@ -396,7 +395,7 @@ class TestCustomKernel(unittest.TestCase):
     y = Tensor.custom_kernel(y, x, fxn=custom_add_one_kernel)[0]
     if use_custom:
       z = Tensor.empty_like(x)
-      z = Tensor.custom_kernel(y, y.T.T, fxn=custom_add_one_kernel)[0]
+      z = Tensor.custom_kernel(z, y.T.T, fxn=custom_add_one_kernel)[0]
     else: z = y.T.T+1
     GlobalCounters.reset()
     z.realize()
@@ -422,19 +421,16 @@ class TestCustomKernel(unittest.TestCase):
 
   @Context(DEV="CPU")
   def test_simple_from_source(self):
-    a = Tensor([0., 1., 2.]).realize()
-
-    src = "void test_src(float* restrict a) { a[0] = 1.0; }"
+    a = Tensor.arange(4).clone().realize()
+    src = "void test_src(int* restrict a) { a[0] = 1; }"
     # TODO: it currently requires a compiler for Ops.BINARY
     from tinygrad.device import Device
     binary = Device[a.device].renderer.compiler.compile(src)
     def custom_src_kernel(A:UOp) -> UOp:
       sink = UOp.sink(A, arg=KernelInfo(name="test_src"))
-      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="CPU"), UOp(Ops.LINEAR, src=tuple(sink.toposort())),
-                                   UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
-
-    a = Tensor.custom_kernel(a, fxn=custom_src_kernel)[0]
-    self.assertEqual(a.tolist(), [1., 1., 2.])
+      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(sink.toposort())), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
+    a = Tensor.custom_kernel(a.reshape(2, 2).T, fxn=custom_src_kernel)[0]
+    self.assertEqual(a.tolist(), [[1, 2], [1, 3]])
 
 class TestUOpReduce(unittest.TestCase):
   def test_uop_sum(self):
