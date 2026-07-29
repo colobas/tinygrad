@@ -483,7 +483,7 @@ class Handler(HTTPRequestHandler):
         for c in content:
           if c["type"] == "text": ids += tok.encode(c["text"])
           else: raise RuntimeError(f"unhandled type: {c['type']}")
-      else: raise RuntimeError(f"unknown content type: {type(content)}")
+      elif content is not None: raise RuntimeError(f"unknown content type: {type(content)}")
       if msg["role"] == "assistant" and i == len(messages) - 1: break
       ids += tok.end_turn()
     else: ids += tok.role("assistant")
