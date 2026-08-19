@@ -469,20 +469,25 @@ def fetch(url:str, name:pathlib.Path|str|None=None, subdir:str|None=None, gunzip
     fp = _ensure_downloads_dir() / (subdir or "") / ((name or hashlib.md5(url.encode('utf-8')).hexdigest()) + hh + (".gunzip" if gunzip else ""))
   if not fp.is_file() or not allow_caching or (sha256 and hashlib.sha256(fp.read_bytes()).hexdigest() != sha256):
     (_dir := fp.parent).mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "tinygrad 0.13.0", **headers}), timeout=10) as r:
+    partial = fp.with_name(fp.name + ".partial")
+    offset = partial.stat().st_size if partial.exists() and not gunzip else 0
+    request_headers = {"User-Agent": "tinygrad 0.13.0", **headers, **({"Range": f"bytes={offset}-"} if offset else {})}
+    with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers), timeout=10) as r:
       assert r.status in {200, 206}, r.status
-      length = int(r.headers.get('content-length', 0)) if not gunzip else None
+      # A server may ignore Range; discard the partial file rather than corrupting the result.
+      if offset and r.status != 206: offset = 0
+      length = (offset + int(r.headers.get('content-length', 0))) if not gunzip else None
       readfile = gzip.GzipFile(fileobj=r) if gunzip else r
-      progress_bar:tqdm = tqdm(total=length, unit='B', unit_scale=True, desc=f"{url}")
+      progress_bar:tqdm = tqdm(total=length, initial=offset, unit='B', unit_scale=True, desc=f"{url}")
       h = hashlib.sha256() if sha256 else None
-      with tempfile.NamedTemporaryFile(dir=_dir, delete=False) as f:
+      if h and offset: h.update(partial.read_bytes())
+      with open(partial, 'ab' if offset else 'wb') as f:
         while chunk := readfile.read(16384):
           if h: h.update(chunk)
           progress_bar.update(f.write(chunk))
-        f.close()
-        if h and (actual_sha256:=h.hexdigest()) != sha256: raise RuntimeError(f"fetch sha mismatch, expected {sha256} but got {actual_sha256}")
-        pathlib.Path(f.name).rename(fp)
-      progress_bar.update(close=True)
+      progress_bar.close()
+      if h and (actual_sha256:=h.hexdigest()) != sha256: raise RuntimeError(f"fetch sha mismatch, expected {sha256} but got {actual_sha256}")
+      partial.rename(fp)
       if length and (file_size:=os.stat(fp).st_size) < length: raise RuntimeError(f"fetch size incomplete, {file_size} < {length}")
   return fp
 
