@@ -1,9 +1,22 @@
 from __future__ import annotations
-import functools, itertools, pathlib
+import enum, functools, itertools, pathlib, array
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
+from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
+
+class ExpertGating(enum.IntEnum):
+  SOFTMAX = 1
+  SIGMOID = 2
+  SOFTMAX_WEIGHT = 3
+  SQRT_SOFTPLUS = 4
+
+def _f32_vocab(vals) -> Tensor:
+  # fast host->device for a vocab-length float vector: build raw f32 bytes and bitcast, avoiding the
+  # element-by-element Tensor(list) path (~100ms at 150k vocab vs ~3ms here) on the per-token decode loop.
+  return Tensor((vals if isinstance(vals, array.array) else array.array('f', vals)).tobytes()).bitcast(dtypes.float32)
+
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -12,7 +25,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
   return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
 
 class ExpertWeights:
-  """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
+  """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
@@ -40,6 +53,7 @@ class SSMConfig:
   group_count: int
   time_step_rank: int
   inner_size: int
+  kda: bool = False
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -59,10 +73,11 @@ class TransformerConfig:
   num_experts: int = 0
   num_experts_per_tok: int = 0
   norm_topk_prob: bool = False
+  expert_gating_func: ExpertGating = ExpertGating.SOFTMAX
   q_lora_rank: int = 0
   kv_lora_rank: int = 0
   shared_expert_dim: int = 0
-  full_attention_interval: int = 0
+  ssm_layers: tuple[bool, ...] = ()
   attn_output_gate: bool = False
   ssm: SSMConfig|None = None
   shared_expert_gate: bool = True
@@ -71,6 +86,19 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  # --- Gemma-4 (gemma4 arch) ----------------------------------------------
+  gemma: bool = False              # build Gemma4Blocks (sandwich norms, GeGLU, layer scale, QK/V norm, unit attn scale)
+  ffn_gelu: bool = False           # GeGLU (gelu_pytorch_tanh) instead of SwiGLU in the dense FFN
+  v_norm: bool = False             # weightless RMS norm on V (Gemma)
+  k_eq_v: bool = False             # no v_proj; reuse the K projection as V (Gemma full-attention layers)
+  unit_attn_scale: bool = False    # attention QK scale of 1.0 (Gemma) instead of 1/sqrt(head_dim)
+  freq_factors: bool = False       # per-layer proportional RoPE via rope_freqs (Gemma full-attention layers)
+  embed_scale: float = 1.0         # multiply token embeddings (Gemma: sqrt(dim))
+  final_softcap: float = 0.0       # final-logit soft-capping (Gemma: 30.0)
+  sliding_pattern: tuple = ()      # per-layer: True=sliding, False=full attention
+  head_dim_full: int = 0           # full-attention head_dim (Gemma: 512; sliding uses head_dim)
+  n_kv_heads_full: int = 0         # full-attention KV heads (Gemma: 4)
+  rope_theta_full: float = 0.0     # full-attention rope theta (Gemma: 1e6; sliding uses rope_theta)
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -82,33 +110,40 @@ class FFNBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
-      self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
+      self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
       self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
       if config.shared_expert_dim > 0:
-        self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_down_shexp = nn.Linear(config.shared_expert_dim, config.dim, bias=False)
+        self.ffn_gate_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_down_shexp = Linear(config.shared_expert_dim, config.dim, bias=False)
         if config.shared_expert_gate: self.ffn_gate_inp_shexp = {"weight": Tensor.zeros(config.dim)}
     else:
-      self.ffn_gate    = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_down    = nn.Linear(config.hidden_dim, config.dim, bias=False)
+      self.ffn_gate    = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
-      if hasattr(self, 'exp_probs_b'):
-        probs = logits.sigmoid()
-        _, sel = pairwise_topk(probs + self.exp_probs_b["bias"], self.config.num_experts_per_tok)
-        probs = probs.gather(-1, sel)
-        if self.config.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
-      else:
-        vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
-        probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
+      bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None
+      gating, normalize_topk = self.config.expert_gating_func, self.config.norm_topk_prob
+      # fast path: without selection bias, normalized SOFTMAX is equivalent to SOFTMAX_WEIGHT
+      if gating == ExpertGating.SOFTMAX and bias is None and normalize_topk:
+        gating, normalize_topk = ExpertGating.SOFTMAX_WEIGHT, False
+      if   gating == ExpertGating.SOFTMAX_WEIGHT: scores = logits
+      elif gating == ExpertGating.SOFTMAX:        scores = logits.softmax(-1)
+      elif gating == ExpertGating.SIGMOID:        scores = logits.sigmoid()
+      elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
+
+      _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
+      probs = scores.gather(-1, sel)
+      # SOFTMAX_WEIGHT applies softmax after top-k selection
+      if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
+      if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
       x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
@@ -118,12 +153,11 @@ class FFNBlock:
         out = out + shexp
       return out
     # TODO: remove the need for this contiguous
-    return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    act = self.ffn_gate(x).gelu() if self.config.ffn_gelu else self.ffn_gate(x).silu()
+    return self.ffn_down(act.contiguous() * self.ffn_up(x))
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
-  # return writes that reset this block's state after a cache mismatch
-  def _state_reset_ops(self) -> list[Tensor]: return []
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
@@ -144,14 +178,16 @@ class TransformerBlock(FFNBlock):
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = config.head_dim * config.n_heads * (2 if config.attn_output_gate else 1)
     kv_proj_out      = config.head_dim * config.n_kv_heads
-    self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
-    self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_output = nn.Linear(config.head_dim * config.n_heads, config.dim, bias=False)
+    self.attn_q      = Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
+    self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    if not config.k_eq_v: self.attn_v = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
+
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    q, k = self.attn_q(x), self.attn_k(x)
+    v = k if self.config.k_eq_v else self.attn_v(x)   # Gemma full-attention layers have no v_proj: V = raw k_proj
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -162,9 +198,12 @@ class TransformerBlock(FFNBlock):
     k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+    if self.config.v_norm: v = v * (v.square().mean(-1, keepdim=True) + self.config.norm_eps).rsqrt()  # Gemma weightless V-norm
 
     q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+    # Gemma uses an attention scale of 1.0; pre-scale q so SDPA's built-in 1/sqrt(head_dim) cancels to 1.0
+    if self.config.unit_attn_scale: q = q * (self.config.head_dim ** 0.5)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
@@ -185,25 +224,53 @@ class TransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      # TODO: how is the dtype of this determined?
-      self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
+                                   dtype=dtypes.default_float, device=x.device)
+      if self.config.freq_factors:
+        # Gemma full-attention layers: "proportional" RoPE — divide the per-dim frequency by rope_freqs.
+        d = self.config.rope_dim
+        inv = (self.config.rope_theta ** -(Tensor.arange(0, d, 2)[:d//2] / d)) / self.rope_freqs["weight"].float()
+        ang = Tensor.arange(self.config.max_context).unsqueeze(1) * inv.unsqueeze(0)
+        self.freqs_cis = ang.cos().cat(ang.sin(), dim=-1).clone(x.device)
+      else:
+        self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+
+class Gemma4Block(TransformerBlock):
+  # Gemma-4 backbone: QK-norm + weightless V-norm + unit attn scale + (full layers) proportional RoPE are
+  # handled by the flag-gated TransformerBlock; this adds the Gemma sandwich norms, per-layer output scale,
+  # and (for full-attention layers) the rope_freqs weight. The dense FFN uses GeGLU (config.ffn_gelu).
+  def __init__(self, config:TransformerConfig):
+    super().__init__(config)
+    self.post_attention_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.post_ffw_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.layer_output_scale = {"weight": Tensor.zeros(1)}
+    if config.freq_factors: self.rope_freqs = {"weight": Tensor.zeros(config.rope_dim // 2)}
+
+  def __call__(self, x:Tensor, start_pos:int|UOp):
+    self._init_state(x)
+    @function(precompile=True, allow_implicit=True)
+    def _run(x:Tensor, start_pos:int|UOp):
+      h =   x + self.post_attention_norm(self._attention(self.attn_norm(x), start_pos))
+      out = h + self.post_ffw_norm(self._feed_forward(self.ffn_norm(h)))
+      return (out * self.layer_output_scale["weight"]).contiguous()
+    return _run(x, start_pos)
+
 
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
-      self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
+      self.attn_q_a = Linear(config.dim, config.q_lora_rank, bias=False)
       self.attn_q_a_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
-      self.attn_q_b = nn.Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
+      self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     else:
-      self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
-    self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
+      self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
+    self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
     self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
-    self.attn_output = nn.Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -211,13 +278,13 @@ class MLATransformerBlock(FFNBlock):
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
-    q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T]), dim=-1)
+    if not self.config.ssm or not self.config.ssm.kda: q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
+    q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(q_rope, dim=-1)
 
     kv_a = self.attn_kv_a_mqa(x)
     c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
-    k_rope = apply_rope(
-      kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2),
-      self.freqs_cis[start_pos:start_pos+T])
+    k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
+    if not self.config.ssm or not self.config.ssm.kda: k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
     k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
@@ -243,82 +310,159 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
-    self.attn_qkv, self.attn_gate = nn.Linear(config.dim, self.conv_channels, bias=False), nn.Linear(config.dim, ssm.inner_size, bias=False)
-    self.ssm_alpha, self.ssm_beta = nn.Linear(config.dim, self.num_v_heads, bias=False), nn.Linear(config.dim, self.num_v_heads, bias=False)
+    self.attn_qkv = Linear(config.dim, self.conv_channels, bias=False)
+    if ssm.kda:
+      self.ssm_g_a, self.ssm_g_b = Linear(config.dim, self.head_v_dim, bias=False), Linear(self.head_v_dim, ssm.inner_size, bias=False)
+      self.ssm_f_a, self.ssm_f_b = Linear(config.dim, self.head_k_dim, bias=False), Linear(self.head_k_dim, ssm.inner_size, bias=False)
+    else:
+      self.attn_gate = Linear(config.dim, ssm.inner_size, bias=False)
+      self.ssm_alpha = Linear(config.dim, self.num_v_heads, bias=False)
+    self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False)
     self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
-    self.ssm_dt = {"bias": Tensor.zeros(self.num_v_heads)}
-    self.ssm_a = Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), nn.Linear(ssm.inner_size, config.dim, bias=False)
+    self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
+    self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
+    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
-    assert T == 1, "GatedDeltaNetBlock currently only supports T=1"
+    # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
+    start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
+    initial = Tensor(start_pos).eq(0)
+    is_kda = hasattr(self, "ssm_g_a")
+    symbolic = isinstance(T, UOp)
+    T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
     x = x.half()
-    out_gate = self.attn_gate(x).reshape(B, 1, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, self.num_v_heads, 1, 1)
-    alpha = ((self.ssm_alpha(x).float() + self.ssm_dt["bias"]).softplus() * self.ssm_a).reshape(B, self.num_v_heads, 1, 1).exp()
+    out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
+    out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
+    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+    alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
+    log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
+                 self.ssm_a.reshape(self.num_v_heads, -1))
 
-    # qkv conv
-    conv_window = self.conv_state.cat(self.attn_qkv(x), dim=1)
-    conv_out = (conv_window * self.ssm_conv1d["weight"].T.unsqueeze(0)).sum(1).silu()
+    # qkv conv, conv_state is reset when starting from position 0
+    conv_state = initial.where(0, self.conv_state)
+    # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
+    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
+    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
+    win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
+    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
+    conv_window = Tensor(win)
+    # the last conv_kernel-1 columns of the window become the next conv state
+    conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
+
+    conv_out = functools.reduce(lambda a,b: a+b,
+      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+    if symbolic:
+      out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
+      beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    q = q.reshape(B, self.num_k_heads, self.head_k_dim).normalize(dim=-1).repeat(1, self.num_v_heads//self.num_k_heads, 1)
-    k = k.reshape(B, self.num_k_heads, self.head_k_dim).normalize(dim=-1).repeat(1, self.num_v_heads//self.num_k_heads, 1)
-    v = v.reshape(B, self.num_v_heads, self.head_v_dim)
-    q, k, v = q.mul(self.head_k_dim**-0.5).unsqueeze(-1), k.unsqueeze(-1), v.unsqueeze(-1)
+    qk_eps = 1e-12 if is_kda else 1e-6
+    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
+            .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
+    v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
+    # layout the per-step operands to broadcast against the (B, H, V, K) state
+    q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
+    q, k, v, beta = q.unsqueeze(-2) * self.head_k_dim**-0.5, k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
+    alpha = log_alpha.transpose(1, 2).exp().unsqueeze(-1)  # per-channel decay for kda, per-head otherwise (B, H, T, V|1, 1)
 
-    # recurrent
-    recurrent_state = self.recurrent_state * alpha
-    recurrent_state = recurrent_state + ((v - recurrent_state@k) * beta)@k.transpose(-1, -2)
+    # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
+    state = Tensor(self.recurrent_state.uop.after(conv_state_store)).float()  # carry the conv write into this graph
+    state = initial.where(0, state)
+    outs = []
+    for t in range(T_pad):
+      s1 = state * alpha[:, :, t]  # decay the state
+      delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
+      state = s1 + delta * k[:, :, t]
+      outs.append((state * q[:, :, t]).sum(-1))
 
-    # store the updated state
-    conv_state_store = self.conv_state.uop.store(conv_window[:, 1:, :].cast(self.conv_state.dtype).uop)
-    recurrent_state_store = self.recurrent_state.uop.store(recurrent_state.cast(self.recurrent_state.dtype).uop)
-    recurrent_state = Tensor(self.recurrent_state.uop.after(recurrent_state_store, conv_state_store))
+    # store the updated recurrent state in place, then read the stacked outputs after the write
+    core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)))
 
-    # output
-    core_attn_out = self.ssm_norm((recurrent_state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim))
-    return self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, 1, -1).cast(x.dtype))
-
-  # recurrent state can't be partially reused after divergence, force a full rebuild
-  def _state_reset_ops(self):
-    return [self.conv_state.assign(self.conv_state.const_like(0)),
-            self.recurrent_state.assign(self.recurrent_state.const_like(0))] if hasattr(self, "conv_state") else []
-  def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return 0 if prefix_len != cached_len else prefix_len
+    # output; undo the padding before the output projection
+    z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
+    if symbolic: z = z[:, :T]
+    return self.ssm_out(z.reshape(B, T, -1))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
-      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
+      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
-    block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    if config.gemma:
+      # per-layer config: sliding layers use head_dim/n_kv_heads/rope_theta; full-attention layers override
+      # with the larger global head_dim, fewer KV heads, the full rope theta, and proportional RoPE (rope_freqs).
+      def _layer_cfg(i:int) -> TransformerConfig:
+        full = not config.sliding_pattern[i]
+        hd, nkv, th = (config.head_dim_full, config.n_kv_heads_full, config.rope_theta_full) if full else \
+                      (config.head_dim, config.n_kv_heads, config.rope_theta)
+        return replace(config, head_dim=hd, v_head_dim=hd, rope_dim=hd, qk_norm=hd, n_kv_heads=nkv, rope_theta=th, freq_factors=full, k_eq_v=full)
+      self.blk:list[FFNBlock] = [Gemma4Block(_layer_cfg(i)) for i in range(config.num_blocks)]
+    else:
+      block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
+      self.blk = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
+                  if config.ssm and config.ssm_layers[i] else
+                  block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
-    self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-    self.max_context = config.max_context
+    self.output = Linear(config.dim, config.vocab_size, bias=False)
+    self.max_context, self.vocab_size = config.max_context, config.vocab_size
+    self.embed_scale, self.final_softcap = config.embed_scale, config.final_softcap
+
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    # augmented decode (§7 grammar mask + sampling penalties): separate JITs that take a per-token logit bias
+    # and a generated-token `counts` buffer before sampling. Kept apart from the plain JITs above so the
+    # default decode path is byte-identical and pays nothing (opt-in); neutral inputs make it equal to forward.
+    self.full_prefill_jit = TinyJit(self.forward_full)
+    self.full_rollout_jit = TinyJit(self.forward_full)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def _logits(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
+    if self.embed_scale != 1.0: x = x * self.embed_scale  # Gemma: scale embeddings by sqrt(dim)
     for block in self.blk: x = block(x, start_pos)
-    logits = self.output(self.output_norm(x))[:, -1, :]
+    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    if self.final_softcap: logits = (logits * (1.0/self.final_softcap)).tanh() * self.final_softcap
+    return logits
+
+  def _sample(self, logits:Tensor, temperature:Tensor) -> Tensor:
+
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+  def _penalize(self, logits:Tensor, counts:Tensor, rep_pen:Tensor, presence:Tensor, frequency:Tensor) -> Tensor:
+    # apply OpenAI/HF generation penalties from `counts` (times each token was emitted). repetition_penalty is
+    # sign-dependent (divide positive logits, multiply negative), so it runs here rather than as a host bias;
+    # presence/frequency are additive. Neutral values (rep_pen=1, presence=0, frequency=0) leave logits intact.
+    seen = counts > 0
+    logits = seen.where((logits > 0).where(logits / rep_pen, logits * rep_pen), logits)
+    return logits - presence * seen.float() - frequency * counts
+
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    return self._sample(self._logits(tokens, start_pos), temperature)
+
+  def forward_full(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor, counts:Tensor,
+                   rep_pen:Tensor, presence:Tensor, frequency:Tensor) -> Tensor:
+    # logit_bias is additive (0.0 allowed, large-negative forbidden for the grammar mask); counts/penalties
+    # discourage repetition. All are graph inputs, so there's no recompile per step.
+    logits = self._penalize(self._logits(tokens, start_pos), counts, rep_pen, presence, frequency)
+    return self._sample(logits + logit_bias, temperature)
+
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+
+  def call_full(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, logit_bias:Tensor, counts:Tensor,
+                rep_pen:Tensor, presence:Tensor, frequency:Tensor) -> Tensor:
+    jit = self.full_prefill_jit if resolve(tokens.shape[1] != 1) else self.full_rollout_jit
+    return jit(tokens.contiguous(), start_pos, temperature, logit_bias, counts, rep_pen, presence, frequency)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -334,11 +478,52 @@ class Transformer:
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
+
+    if arch == 'gemma4':
+      g = lambda k, d=None: kv.get(f'gemma4.{k}', d)
+      if g('expert_count', 0): raise NotImplementedError("gemma4 MoE is not yet supported in tinygrad (dense models only)")
+      pattern = [bool(p) for p in g('attention.sliding_window_pattern')]   # True = sliding, False = full attention
+      kvh, dim = g('attention.head_count_kv'), g('embedding_length')        # head_count_kv is per-layer
+      s_i, f_i = pattern.index(True), pattern.index(False)                  # representative sliding / full layer indices
+      config = TransformerConfig(
+        num_blocks=g('block_count'), dim=dim, hidden_dim=g('feed_forward_length'),
+        n_heads=g('attention.head_count'), n_kv_heads=kvh[s_i], norm_eps=g('attention.layer_norm_rms_epsilon'),
+        vocab_size=len(kv['tokenizer.ggml.tokens']),
+        head_dim=g('attention.key_length_swa'), rope_theta=g('rope.freq_base_swa'),
+        rope_dim=g('attention.key_length_swa'), v_head_dim=g('attention.key_length_swa'),
+        max_context=max_context, qk_norm=g('attention.key_length_swa'),
+        gemma=True, ffn_gelu=True, v_norm=True, unit_attn_scale=True,
+        embed_scale=dim ** 0.5, final_softcap=g('final_logit_softcapping', 0.0), sliding_pattern=tuple(pattern),
+        head_dim_full=g('attention.key_length'), n_kv_heads_full=kvh[f_i], rope_theta_full=g('rope.freq_base'))
+      # rope_freqs is a single global tensor shared by every full-attention layer; bind it under each full layer's name
+      if 'rope_freqs.weight' in state_dict:
+        for i, p in enumerate(pattern):
+          if not p: state_dict[f'blk.{i}.rope_freqs.weight'] = state_dict['rope_freqs.weight']
+      model = Transformer(config)
+      nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
+      if realize:
+        for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
+        Tensor.realize(*params)
+      return model, kv
+
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
 
     ssm = None
+    ssm_layers: tuple[bool, ...] = ()
     if arch in ('qwen35', 'qwen35moe'):
       ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')})
+      ssm_layers = tuple((i+1) % kv[f'{arch}.full_attention_interval'] != 0 for i in range(kv[f'{arch}.block_count']))
+    elif arch == 'kimi-linear':
+      ssm_layers = tuple(x == 0 for x in n_kv_heads)
+      n_kv_heads = max(n_kv_heads)
+      ssm = SSMConfig(kv[f'{arch}.ssm.conv_kernel'], kv[f'{arch}.kda.head_dim'], n_heads, n_heads, n_heads*kv[f'{arch}.kda.head_dim'], kda=True)
+      for i, is_ssm in enumerate(ssm_layers):
+        if not is_ssm: continue
+        state_dict[f"blk.{i}.attn_qkv.weight"] = state_dict.pop(f"blk.{i}.attn_q.weight").cat(
+          state_dict.pop(f"blk.{i}.attn_k.weight"), state_dict.pop(f"blk.{i}.attn_v.weight"), dim=0).contiguous()
+        state_dict[f"blk.{i}.ssm_conv1d.weight"] = state_dict.pop(f"blk.{i}.ssm_conv1d_q.weight").cat(
+          state_dict.pop(f"blk.{i}.ssm_conv1d_k.weight"), state_dict.pop(f"blk.{i}.ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
+        state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
     if arch in ('qwen35', 'qwen35moe', 'glm4moe'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
@@ -348,6 +533,7 @@ class Transformer:
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
+      if arch == 'kimi-linear': continue
       if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
         w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
@@ -369,7 +555,8 @@ class Transformer:
       max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe')),
+      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe', 'kimi-linear')),
+      expert_gating_func=ExpertGating(kv.get(f'{arch}.expert_gating_func', ExpertGating.SOFTMAX)),
       kv_lora_rank=kv_lora_rank, q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0),
       leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0),
       shared_expert_dim=kv.get(
@@ -378,7 +565,7 @@ class Transformer:
       shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict,
       dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
-      full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
+      ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
@@ -389,28 +576,58 @@ class Transformer:
       Tensor.realize(*params)
     return model, kv
 
+  def warmup(self):
+    for _ in range(2): list(zip(range(2), self.generate([0])))
+
   def get_start_pos(self, tokens:list[int]) -> int:
+    # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
+    if self.has_recurrent_block:
+      return len(self._cached_tokens) if self._cached_tokens and len(self._cached_tokens) < len(tokens) \
+        and tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mask_fn=None,
+               rep_pen:float=1.0, presence_pen:float=0.0, freq_pen:float=0.0):
+    # mask_fn (optional, §7) is given the completion-so-far token ids and returns a vocab-length additive
+    # logit bias (0 = allowed, large-negative = forbidden) for the next token, or None to leave it unmasked.
+    # rep_pen/presence_pen/freq_pen (optional) apply generation penalties over the completion's token counts.
+    # When none are active the plain decode path runs unchanged.
     if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
+    # opt-in augmented path: only build the penalty/mask inputs (and use the heavier JIT) when actually needed
+    penalize = rep_pen != 1.0 or presence_pen != 0.0 or freq_pen != 0.0
+    use_full = mask_fn is not None or penalize
+    if use_full:
+      rp, pp, fp = Tensor([rep_pen]), Tensor([presence_pen]), Tensor([freq_pen])
+      zeros_bias = Tensor.zeros(self.vocab_size, dtype="float32").contiguous().realize()
+      zeros_counts = Tensor.zeros(self.vocab_size, dtype="float32").contiguous().realize()
+      counts = array.array('f', bytes(4 * self.vocab_size)) if penalize else None  # mutable f32 counts (in place)
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
-    if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      nt_val = min(chunk_size, len(tokens) - start_pos)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(nt_val)
+      inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
+      # this call emits a sampled token iff it consumes the rest of the context; only those need mask/penalties
+      if use_full and start_pos + nt_val >= len(tokens):
+        bias = mask_fn(tokens[prompt_len:]) if mask_fn is not None else None
+        bias_t = _f32_vocab(bias) if bias is not None else zeros_bias
+        counts_t = _f32_vocab(counts) if penalize else zeros_counts
+        out = self.call_full(inp, sp, temp, bias_t, counts_t, rp, pp, fp).realize()
+      else:
+        out = self(inp, sp, temp).realize()
       start_pos += nt.val
+
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
+      if penalize: counts[tokens[-1]] += 1.0  # only the generated completion is penalized, not the prompt
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]

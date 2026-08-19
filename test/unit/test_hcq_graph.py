@@ -21,14 +21,14 @@ class TestHCQUnit(unittest.TestCase):
     for _ in range(5): f(inp, inp_cpu)
 
     # construct minimal CALL UOps for supports_uop (graphs only see PROGRAMs after compile_linear)
-    gpu_call = UOp(Ops.PROGRAM, src=(UOp.sink(), UOp(Ops.DEVICE, arg=Device.DEFAULT))).call(UOp.new_buffer(Device.DEFAULT, 1, dtypes.float))
-    cpu_call = UOp(Ops.PROGRAM, src=(UOp.sink(), UOp(Ops.DEVICE, arg="CPU"))).call(UOp.new_buffer("CPU", 1, dtypes.float))
+    gpu_call = UOp(Ops.PROGRAM, src=(UOp.sink(),)).call(UOp.new_buffer(Device.DEFAULT, 1, dtypes.float))
+    cpu_call = UOp(Ops.PROGRAM, src=(UOp.sink(),)).call(UOp.new_buffer("CPU", 1, dtypes.float))
     gpu_devs = [d0]
 
-    # local MMIO: GPU works alone and with CPU in batch (cpu_support=True)
+    # CPU uses HCQ2 and is no longer batched into legacy HCQ graphs.
     assert HCQGraph.supports_uop(gpu_devs, gpu_call) is True
-    assert HCQGraph.supports_uop(gpu_devs, cpu_call) is True
-    assert HCQGraph.supports_uop(gpu_devs + [cpu_dev], gpu_call) is True
+    assert HCQGraph.supports_uop(gpu_devs, cpu_call) is False
+    assert HCQGraph.supports_uop(gpu_devs + [cpu_dev], gpu_call) is False
 
     # USB MMIO: GPU-only still works, but CPU batching must be rejected (cpu_support=False)
     orig_view = d0.timeline_signal.base_buf.view
