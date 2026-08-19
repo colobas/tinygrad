@@ -1,12 +1,12 @@
 import unittest, random
 from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes, Variable
-from tinygrad.uop.ops import Ops, UOp, AxisType
+from tinygrad.uop.ops import Ops, UOp, AxisType, graph_rewrite
 from tinygrad.helpers import getenv, prod, Context
 from tinygrad.nn.state import get_parameters
-from tinygrad.engine.realize import run_linear, compile_linear
+from tinygrad.engine.realize import run_linear, compile_linear, pm_beam, pm_compile
 import numpy as np
 from hypothesis import given, strategies as strat, settings
-from test.helpers import not_support_multi_device, needs_second_gpu, slow, call_is_graph
+from test.helpers import not_support_multi_device, needs_second_gpu, slow, call_is_graph, check_schedule, assert_kernel_count, KernelCountException
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
@@ -62,7 +62,7 @@ class TestMultiTensor(unittest.TestCase):
   def test_shard_empty(self):
     GlobalCounters.reset()
     X = Tensor.empty(256).shard(devices_2, 0).realize()
-    assert GlobalCounters.kernel_count == 0
+    assert_kernel_count(0)
     (X + X).realize()
 
   # TODO: fix this to not copy on the src device
@@ -75,6 +75,13 @@ class TestMultiTensor(unittest.TestCase):
     names = [call.src[0].src[0].arg.name for call in linear.src if call.src[0].op is Ops.PROGRAM]
     run_linear(linear)
     self.assertEqual(len(set(names)), 1, "function was relinearized")
+
+  def test_shard_beam(self):
+    cpu_2 = ("CPU:1", "CPU:2")
+    src = Tensor.ones(16).shard(cpu_2, 0).realize()
+    lin = UOp(Ops.LINEAR, src=(src.to(cpu_2[::-1]).schedule_linear().src[0],))
+    with Context(BEAM=1, IGNORE_BEAM_CACHE=1): call = graph_rewrite(graph_rewrite(lin, pm_beam, ctx=1, walk=True), pm_compile, walk=True).src[0]
+    self.assertNotEqual(call.src[0].src[0].arg.applied_opts, ())
 
   def test_shard_same_device(self):
     X = Tensor.ones(256).contiguous().realize()
@@ -348,8 +355,7 @@ class TestMultiTensor(unittest.TestCase):
   def test_const_like_shrink_on_shard_axis(self):
     t = Tensor.ones(16, 16, dtype=dtypes.int).shard(devices_2, axis=0)
     out = t.const_like(2)[:, :8]
-    linear, var_vals = out.linear_with_vars()
-    self.assertEqual(len(linear.src), 0)
+    linear, var_vals = check_schedule(out, 0)
     run_linear(linear, var_vals)
     self.assertEqual(out.tolist(), [[2]*8]*16)
 
@@ -389,7 +395,7 @@ class TestMultiBufferView(unittest.TestCase):
     linear, var_vals = b_multi.linear_with_vars()
     if all(not d.startswith(("WEBGPU", "CL")) for d in b_multi.device):
       compiled = [call for call in linear.src if call.src[0].op is Ops.SINK]
-      self.assertEqual(len(compiled), 0, f"expected zero compiled kernels, got {len(compiled)}")
+      if len(compiled) != 0: raise KernelCountException(0, len(compiled))
     run_linear(linear, var_vals)
     np.testing.assert_equal(b_multi.numpy(), b_ref.numpy())
 

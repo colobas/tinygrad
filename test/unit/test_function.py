@@ -2,8 +2,9 @@ import numpy as np
 import unittest
 from tinygrad.function import function
 from tinygrad import Tensor, GlobalCounters, Device
-from tinygrad.dtype import dtypes, Invalid
+from tinygrad.dtype import Invalid
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo
+from test.helpers import assert_kernel_count, KernelCountException
 
 class TestFunction(unittest.TestCase):
   def test_simple(self):
@@ -515,7 +516,7 @@ class TestFunctionTuple(unittest.TestCase):
     Tensor.realize(a)
     c = f(a)
 
-    self.assertEqual(count_kernels(c), 1)
+    if count_kernels(c) != 1: raise KernelCountException(1, count_kernels(c))
 
     c.sum().backward()
     Tensor.realize(a.grad)
@@ -593,7 +594,7 @@ class TestFunctionTuple(unittest.TestCase):
     state = Tensor([10., 20., 30., 40.], device="CPU").contiguous().realize()
     @function(precompile=True, allow_implicit=True)
     def f(a:Tensor):
-      after = state.uop.after(state.uop.shrink(((0, 2),)).store(UOp.const(dtypes.float32, Invalid, shape=(2,))))
+      after = state.uop.after(state.uop.shrink(((0, 2),)).store(Invalid))
       return Tensor(after).contiguous() + a
     out = f(Tensor([1., 1., 1., 1.], device="CPU").contiguous().realize())
     np.testing.assert_allclose(out.numpy(), [11., 21., 31., 41.])
@@ -618,7 +619,7 @@ class TestFunctionTuple(unittest.TestCase):
     out = f(a)
     GlobalCounters.reset()
     out.realize()
-    self.assertEqual(GlobalCounters.kernel_count, kernel_count)
+    assert_kernel_count(kernel_count)
     np.testing.assert_allclose(out.numpy(), [3., 5., 7., 9.])
 
   def test_custom_kernel_precompile_further_compute_multi(self): self.test_custom_kernel_precompile_further_compute(multi=True, kernel_count=4)

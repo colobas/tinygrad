@@ -720,13 +720,25 @@ class TestOps(unittest.TestCase):
       return torch.autograd.grad(t ** c, t)[0].item()
     for x in [-math.inf, 0, 1, math.inf]:
       for c in [-1, 0, 0.3, 1, 2]:
-        tiny_out = get_tiny_gradient(x, c)
         torch_out = get_torch_gradient(x, c)
+        # the pow backward routes through exp2/log2, whose 0/inf behavior is undefined on WEBGPU
+        if Device.DEFAULT == "WEBGPU" and not math.isfinite(torch_out): continue
+        tiny_out = get_tiny_gradient(x, c)
         if math.isnan(tiny_out):
-          if Device.DEFAULT == "WEBGPU": continue # TODO: WEBGPU issue with nan
           assert math.isnan(torch_out)
         else:
           self.assertAlmostEqual(tiny_out, torch_out, msg=f"{x}, {c}")
+
+  def test_pow_neg_inf_frac_exponent(self):
+    # pow(-inf, 0.3) is +inf, so the gradient 0.3*pow(-inf, -0.7) is 0, never nan
+    helper_test_op(None, lambda x: x**0.3, vals=[[-math.inf]])
+    # is_odd truncates, so it calls 3.3 odd: only the non_int guard keeps pow(-inf, 3.3) from negating to -inf
+    helper_test_op(None, lambda x: x**3.3, vals=[[-math.inf]])
+
+  def test_pow_zero_exponent(self):
+    # x ** 0 is the constant 1 for every x, so the gradient with respect to the base is 0, never nan
+    # TODO: nan ** 0, failed on WEBGPU
+    helper_test_op(None, lambda x,y: x**y, vals=[[-math.inf, math.inf, 0.0], [0.0, 0.0, 0.0]])
 
   def test_pow_zero_tensor(self):
     helper_test_op(None, lambda x,y: x**y, vals=[[0.0], [0.0]])
@@ -738,6 +750,7 @@ class TestOps(unittest.TestCase):
   def test_exp2_log2_zero_times_negative(self):
     # gallivm's exp2/log2 have "undefined behavior with infs, 0s and nans", so exp2(log2(0)*y) returns 0 instead of inf
     helper_test_op(None, lambda x,y: (x.log2()*y).exp2(), lambda x,y: (x.log2()*y).exp2(), vals=[[0.0], [-0.7]], forward_only=True)
+  @unittest.skipIf(Device.DEFAULT == "WEBGPU", "pow at 0 routes through exp2/log2, whose 0/inf behavior is undefined on WEBGPU")
   def test_pow_zero_const(self):
     helper_test_op(None, lambda x: x**0.3, vals=[[0.0]])
     helper_test_op(None, lambda x: x**0.0, vals=[[0.0]])
@@ -1524,6 +1537,8 @@ class TestOps(unittest.TestCase):
 
   def test_prod(self):
     helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 3.0]])
+    helper_test_op(None, lambda x: x.prod(), vals=[[0.0, 2.0, 3.0]])
+    helper_test_op(None, lambda x: x.prod(), vals=[[0.0, 0.0, 3.0]])
     with Context(NOOPT=1): helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 3.0]])
     helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=3), lambda x: x.prod(axis=3))
     helper_test_op([(3,4,5,6)], lambda x: x.prod(dim=1), lambda x: x.prod(axis=1))
@@ -1728,6 +1743,8 @@ class TestOps(unittest.TestCase):
     helper_test_op([(10,10,10)], lambda x: x.log_softmax(0), atol=1e-7, grad_atol=1e-7)
     helper_test_op([(10,10,10)], lambda x: x.log_softmax(1), atol=1e-7, grad_atol=1e-7)
     helper_test_op([(10,10,10)], lambda x: x.log_softmax(2), atol=1e-7, grad_atol=1e-7)
+  def test_softmin(self):
+    helper_test_op([(45,65)], torch.nn.Softmin(dim=1), Tensor.softmin, atol=1e-7, grad_atol=1e-7)
 
   def test_normalize(self):
     helper_test_op([(45,65)], lambda x: torch.nn.functional.normalize(x), lambda x: x.normalize(), atol=1e-7, grad_atol=1e-7)

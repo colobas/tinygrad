@@ -46,6 +46,16 @@ class MovementMixin:
     """
     return prod(self.shape)
 
+  @property
+  def max_shape(self) -> tuple[int, ...]:
+    """The shape with every symbolic dimension replaced by its maximum."""
+    from tinygrad.uop.ops import to_max_shape  # deferred: ops.py imports the mixins
+    return to_max_shape(self.shape)
+
+  def max_numel(self) -> int:
+    """The number of elements in `max_shape`."""
+    return prod(self.max_shape)
+
   def size(self, dim:int|None=None) -> sint|tuple[sint, ...]:
     """
     Returns the size of the tensor. If `dim` is specified, return the length along dimension `dim`. Otherwise return the shape of the tensor.
@@ -90,8 +100,11 @@ class MovementMixin:
         if resolve(index.step == 0, False): raise ValueError(f"{index=} cannot have 0 as step")
         start, stop = 0 if index.start is None else index.start, size if index.stop is None else index.stop
         step = 1 if index.step is None else index.step
+        # resolve negative int bounds against the (possibly symbolic) size, like slice.indices
+        if isinstance(start, int) and start < 0: start = start + size
+        if isinstance(stop, int) and stop < 0: stop = stop + size
         if all_int((start, stop, step)):
-          # handle int slicing (resolve negative bounds, clamp, stride)
+          # handle int slicing (clamp, stride)
           *bound, stride = index.indices(int(size.vmax) if isinstance(size, UOp) else size)
           bound = [0, 0] if stride * (bound[1] - bound[0]) < 0 else ([bound[1]+1, bound[0]+1] if stride < 0 else bound)
           return {"size":ceildiv(bound[1]-bound[0], abs(stride)), "boundary":tuple(bound), "stride":stride, "collapse_dim":False}
@@ -265,7 +278,8 @@ class MovementMixin:
     return self.shrink(tuple([None if ns is None else (0, ns) for ns in argfix(shape, *args)]))
 
   def pad_to(self, shape, *args) -> Self:
-    return self._mop(Ops.PAD, tuple((0, s if ns is None else ns) for s,ns in zip(self.shape, argfix(shape, *args), strict=True)))
+    ret = self._mop(Ops.PAD, tuple((0, s if ns is None else ns) for s,ns in zip(self.shape, argfix(shape, *args), strict=True)))
+    return self if ret.shape == self.shape else ret
 
   def view(self, shape, *args) -> Self:
     """`.view` is an alias for `.reshape`."""

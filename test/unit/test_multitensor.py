@@ -2,7 +2,7 @@ import unittest, numpy as np
 from tinygrad import Tensor, Variable, Context, Device, TinyJit, GlobalCounters, dtypes, UOp, nn, getenv
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.uop.ops import Ops
-from test.helpers import not_support_multi_device, needs_second_gpu, slow
+from test.helpers import not_support_multi_device, needs_second_gpu, slow, assert_kernel_count, KernelCountException
 from hypothesis import given, strategies as strat, settings
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
@@ -60,8 +60,8 @@ class TestMultiTensor(unittest.TestCase):
   def test_shard_elementwise(self): self._test_shard_op(lambda t:(t+t).reshape(2, 2), [[2.,2.],[2.,2.]])
   def test_alu_deviceless_const(self):
     s = Tensor([1.0, 2, 3, 4]).shard((f"{Device.DEFAULT}:0", f"{Device.DEFAULT}:1"), axis=0)
-    np.testing.assert_equal((s + Tensor(UOp.const(dtypes.float, 1.0))).numpy(), [2, 3, 4, 5])
-    np.testing.assert_equal((s + Tensor(UOp.const(dtypes.float, 1.0)).reshape((1,)).expand((4,))).numpy(), [2, 3, 4, 5])
+    np.testing.assert_equal((s + Tensor(UOp.const(1.0).cast(dtypes.float))).numpy(), [2, 3, 4, 5])
+    np.testing.assert_equal((s + Tensor(UOp.const(1.0).cast(dtypes.float)).reshape((1,)).expand((4,))).numpy(), [2, 3, 4, 5])
 
   def test_add_rank_expand_shard(self):
     # a sharded src keeps its own rank under implicit broadcast, its shard axis right-aligns into the output
@@ -143,9 +143,8 @@ class TestMultiTensor(unittest.TestCase):
     GlobalCounters.reset()
     with Context(ALLREDUCE_CAST=1, RING=0, ALL2ALL=0):
       tst.realize()
-    kernel_count = GlobalCounters.kernel_count
+    assert_kernel_count(kernel_count)
     np.testing.assert_allclose(tst.numpy(), (a_src.numpy()+b_src.numpy()).sum(0))
-    self.assertEqual(kernel_count, kernel_count)
 
   def test_allreduce_cast_half_assign(self): self.test_allreduce_cast_half(assign=True, kernel_count=10)
 
@@ -385,6 +384,18 @@ class TestMultiTensor(unittest.TestCase):
       np.testing.assert_allclose(r.numpy(), np.ones(256)+np.ones(256), atol=1e-4, rtol=1e-5)
     assert jf.captured is not None
 
+  def test_symbolic_broadcast_copy(self):
+    rows = Variable("rows", 1, 4).bind(3)
+    out = Tensor.ones(rows, 8).to(devices_2).realize()
+    self.assertEqual(out.shape, (rows, 8))
+    np.testing.assert_equal(out[:3].to(Device.DEFAULT).numpy(), np.ones((3, 8)))
+
+  def test_symbolic_broadcast_consumed(self):
+    rows = Variable("rows", 1, 4).bind(3)
+    out = (Tensor.ones(rows).to(devices_2) + 1).realize()
+    self.assertEqual(out.shape, (rows,))
+    np.testing.assert_equal(out[:3].to(Device.DEFAULT).numpy(), np.full(3, 2))
+
   def test_multitensor_jit_in_list(self):
     # test MULTI tensor inside a list container - exercises the container unpacking + MULTI unpacking
     @TinyJit
@@ -584,7 +595,7 @@ class TestMultiTensor(unittest.TestCase):
       zeros = Tensor.zeros(3).realize()
     b = a.to(devices_2)*zeros.to(devices_2)
     sched = b.schedule_linear().src
-    self.assertEqual(len(sched), 0)
+    if len(sched) != 0: raise KernelCountException(0, len(sched))
     self.assertListEqual(b.tolist(), [0, 0, 0])
 
 @unittest.skipIf(not_support_multi_device(), "no multi")

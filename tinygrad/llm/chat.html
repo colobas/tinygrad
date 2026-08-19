@@ -23,7 +23,7 @@
     const d = document.createElement('div'); d.className = 'msg'; chat.appendChild(d);
     const r = await fetch('/v1/chat/completions', {method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({model: 'llama', messages: msgs, stream: true, temperature: 0.7})});
-    let buf = '', reason = null, content = null;
+    let buf = '', reason = null, content = null, reasoning_content = '';
     for (const rd = r.body.getReader(), dec = new TextDecoder();;) {
       const {done, value} = await rd.read();
       if (done) break;
@@ -34,9 +34,9 @@
         if (ln.startsWith('data: ') && !ln.includes('[DONE]'))
           try {
             const delta = JSON.parse(ln.slice(6)).choices[0]?.delta || {};
-            if (delta.reasoning_content) {  // show the model's thinking trace, dimmed, above the answer
+            if (delta.reasoning_content) {
               if (!reason) { reason = document.createElement('div'); reason.className = 'reason'; d.appendChild(reason); }
-              reason.textContent += delta.reasoning_content;
+              reason.textContent += delta.reasoning_content; reasoning_content += delta.reasoning_content;
             }
             if (delta.content) {
               if (!content) { content = document.createElement('span'); d.appendChild(content); }
@@ -45,6 +45,8 @@
           } catch {}
       chat.scrollTop = chat.scrollHeight;
     }
-    msgs.push({role: 'assistant', content: content ? content.textContent : ''});
+    const m = {role: 'assistant', content: content ? content.textContent : ''};
+    if (reasoning_content) m.reasoning_content = reasoning_content;
+    msgs.push(m);
   }
 </script></body></html>

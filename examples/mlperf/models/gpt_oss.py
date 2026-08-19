@@ -12,11 +12,15 @@ from tinygrad.helpers import Timing, colored, GlobalCounters, profile_marker
 from tinygrad.uop.ops import Ops, UOp
 from extra.models.llama import apply_rotary_emb
 from extra.llama_kernels.rmsnorm import rmsnorm
-from extra.gemm.cdna_asm_gemm import _mx_block_scale, _mx_block_scale_3d, quantize_mxfp8
+from extra.gemm.cdna_asm_gemm import _mx_block_scale, _mx_block_scale_3d, quantize_mxfp8, asm_gemm, can_use_asm_gemm
+from extra.gemm.moe_gemm import grouped_mx_gemm
+from extra.gemm.moe_routing import route, dispatch, combine
 
 FP8_DTYPE = dtypes.fp8e4m3
 FP8_MAX = 448.0
-INIT_STD = 0.008
+INIT_STD = 0.02
+ASM_GEMM = getenv("ASM_GEMM", 0)
+
 
 def _quant_dequant_fwd(x:Tensor) -> Tensor:
   # x (2d bf16) -> bf16 value after an mxfp8 round-trip (1x32 block scaling on the last axis)
@@ -50,8 +54,7 @@ def _dequant_fwd_fxn(wq_p, ws_p, device):
   return _dequant_fwd(Tensor(wq_p, device=device), Tensor(ws_p, device=device))
 
 def _dequant_bwd(grad:UOp, call:UOp) -> tuple:
-  w_scale = Tensor(call.src[2])
-  return ((Tensor(grad).cast(dtypes.bfloat16) * _mx_scale(w_scale).cast(dtypes.bfloat16)).uop, None)
+  return (Tensor(grad).cast(dtypes.bfloat16).uop, None)
 
 def dequant_weight(w_q:Tensor, w_scale:Tensor) -> Tensor:
   fxn = _dequant_fwd_fxn(w_q.as_param(0).uop, w_scale.as_param(1).uop, w_q.device)
@@ -60,9 +63,33 @@ def dequant_weight(w_q:Tensor, w_scale:Tensor) -> Tensor:
 
 def matmul_mx(x:Tensor, w_q:Tensor, w_scale:Tensor) -> Tensor:
   l_shape = x.shape[:-1]
+  if ASM_GEMM:
+    from extra.gemm.cdna_asm_gemm import asm_gemm, can_use_asm_gemm, mx_pack
+    x2, K, N = x.reshape(-1, x.shape[-1]), x.shape[-1], w_q.shape[0]
+    wq, ws = w_q, w_scale
+    if (pad := (-K) % 256):
+      x2 = x2.pad(((0, 0), (0, pad)))
+      wq = wq.pad(((0, 0), (0, pad)))
+      ws = ws.pad(((0, 0), (0, pad // 32)), value=127).cast(dtypes.uint8)
+    if (npad := (-N) % 256):
+      wq = wq.pad(((0, npad), (0, 0)))
+      ws = ws.pad(((0, npad), (0, 0)), value=127).cast(dtypes.uint8)
+    x_q, x_e8, x_si = quantize_mxfp8(x2)
+    if x_si is not None and can_use_asm_gemm(x_q, wq.T):
+      out = asm_gemm(x_q, wq.T, mx=True, mx_scales=(x_si, x_e8, mx_pack(ws), ws), mx_w_stored=True)
+      return (out[:, :N] if npad else out).reshape(*l_shape, N).cast(dtypes.bfloat16)
   x_phys = quant_dequant_mx(x.reshape(-1, x.shape[-1])).reshape(*l_shape, x.shape[-1])
   w_phys = dequant_weight(w_q, w_scale)
   return (x_phys @ w_phys.T).cast(dtypes.bfloat16)
+
+def _pad_to_mult(t:Tensor, axis:int, mult:int=256) -> Tensor:
+  if (r := (-t.shape[axis]) % mult) == 0: return t
+  pads = [(0, 0)] * t.ndim
+  pads[axis] = (0, r)
+  return t.pad(tuple(pads))
+
+def _pad_cols(t:Tensor) -> Tensor: return _pad_to_mult(t, -1)
+def _pad_rows(t:Tensor) -> Tensor: return _pad_to_mult(t, -2)
 
 def swiglu(x:Tensor, limit:float=7.0, alpha:float=1.702) -> Tensor:
   x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -100,9 +127,9 @@ class GPTOSS:
     self.ffn_norm = Tensor.ones(n_layers, dim).contiguous()
     self.gate = Tensor.normal(n_layers, n_experts, dim, mean=0.0, std=INIT_STD, dtype=dtypes.bfloat16)
     self.gate_bias = Tensor.zeros(n_layers, n_experts, dtype=dtypes.bfloat16).contiguous()
-    self.w_gate_up, self.w_gate_up_scale = self._quant_weight(n_layers, n_experts, intermediate_size * 2, dim)
+    self.w_gate_up, self.w_gate_up_scale = self._quant_weight(n_layers, n_experts, intermediate_size * 2, dim, moe=True)
     self.w_gate_up_bias = Tensor.zeros(n_layers, n_experts, intermediate_size * 2, dtype=dtypes.bfloat16).contiguous()
-    self.w_down, self.w_down_scale = self._quant_weight(n_layers, n_experts, dim, intermediate_size, std=scaled_std)
+    self.w_down, self.w_down_scale = self._quant_weight(n_layers, n_experts, dim, intermediate_size, std=scaled_std, moe=True)
     self.w_down_bias = Tensor.zeros(n_layers, n_experts, dim, dtype=dtypes.bfloat16).contiguous()
 
     # output
@@ -112,10 +139,16 @@ class GPTOSS:
     self.output = Tensor.normal(vocab_size, dim, mean=0.0, std=INIT_STD, dtype=dtypes.bfloat16)
     self.freqs_cis = precompute_freqs_cis(head_dim, max_context * 2, rope_theta).contiguous().is_param_(False)
 
-  def _quant_weight(self, *shape:int, std:float=INIT_STD):
-    w = Tensor.zeros(*shape) if getenv("ZEROS") else Tensor.normal(*shape, mean=0.0, std=std)
-    w_q, w_e8, _ = quantize_mxfp8(w)
-    return w_q, w_e8.is_param_(False)
+  def _quant_weight(self, *shape:int, std:float=INIT_STD, moe:bool=False):
+    def _one(*s:int):
+      w = Tensor.zeros(*s) if getenv("ZEROS") else Tensor.normal(*s, mean=0.0, std=std)
+      w_q, w_e8, _ = quantize_mxfp8(_pad_cols(_pad_rows(w)) if moe else w)
+      return w_q, w_e8.is_param_(False)
+    if moe:
+      qs = [_one(*shape[1:]) for _ in range(shape[0])]
+      for q in qs: q[0]._zero2 = True  # grad arrives sharded on the expert axis under ZeRO-2 (moe_gemm)
+      return [q[0] for q in qs], [q[1] for q in qs]
+    return _one(*shape)
 
   def _attn_mask(self, seqlen:int, dtype) -> Tensor:
     i, j = Tensor.arange(seqlen).reshape(seqlen, 1), Tensor.arange(seqlen).reshape(1, seqlen)
@@ -150,12 +183,12 @@ class GPTOSS:
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
     xq, xk, xv = xq.cast(dtypes.bfloat16), xk.cast(dtypes.bfloat16), xv.cast(dtypes.bfloat16)  # (B,N,H,D)/(B,N,KV,D)
 
-    if sliding:
-      attn = self._sliding_attention(xq, xk, xv, sinks)
-    elif getenv("HK_FLASH_ATTENTION"):
+    if getenv("HK_FLASH_ATTENTION"):
       from extra.thunder.amd.fa import flash_attention
-      attn, *_ = flash_attention(xq, xk, xv, is_causal=True, write_flat=True, sinks=sinks)
+      attn, *_ = flash_attention(xq, xk, xv, is_causal=True, write_flat=True, sinks=sinks, window=self.sliding_window if sliding else 0)
       attn = attn.reshape(bsz, seqlen, self.n_heads * self.head_dim)
+    elif sliding:
+      attn = self._sliding_attention(xq, xk, xv, sinks)
     else:
       xqm = xq.reshape(bsz, seqlen, self.n_kv_heads, self.n_rep, self.head_dim).permute(0, 2, 3, 1, 4)
       xkm, xvm = xk.permute(0, 2, 1, 3).unsqueeze(2), xv.permute(0, 2, 1, 3).unsqueeze(2)
@@ -174,17 +207,32 @@ class GPTOSS:
                    w_down:Tensor, w_down_scale:Tensor, w_down_bias:Tensor):
     x_normed, rrms = rmsnorm(x, self.norm_eps)
     inp = x_normed * ffn_norm
-
     logits = inp.float() @ gate.float().T + gate_bias.float()
-    thresh = logits.topk(self.experts_per_tok)[0][..., -1:]
-    weights = (logits >= thresh).where(logits, -float("inf")).softmax(-1)
+    dim, inter = self.dim, self.intermediate_size
 
-    out = None
-    for e in range(self.n_experts):
-      gate_up = matmul_mx(inp, w_gate_up[e], w_gate_up_scale[e]) + w_gate_up_bias[e]
-      y = (matmul_mx(swiglu(gate_up, self.swiglu_limit), w_down[e], w_down_scale[e]) + w_down_bias[e]).contiguous()
-      contrib = weights[..., e:e+1].cast(y.dtype) * y
-      out = contrib if out is None else out + contrib
+    if getenv("GROUPED_MOE", 0):
+      bsz, seqlen = x.shape[:2]
+      inp, logits = inp.reshape(-1, dim), logits.reshape(-1, self.n_experts)
+      r = route(logits, self.experts_per_tok, self.n_experts)
+      onehot = r.rows_e.one_hot(self.n_experts).float()
+      xg = dispatch(_pad_cols(inp.cast(dtypes.bfloat16)), r)
+      h = grouped_mx_gemm(xg, (w_gate_up, w_gate_up_scale), r.off)[:, :2*inter] + (onehot @ w_gate_up_bias.float()).cast(dtypes.bfloat16)
+      y = swiglu(h, self.swiglu_limit)
+      z = grouped_mx_gemm(_pad_cols(y.cast(dtypes.bfloat16)), (w_down, w_down_scale), r.off)[:, :dim] \
+          + (onehot @ w_down_bias.float()).cast(dtypes.bfloat16)
+      out = combine(z, r, inp.shape[0], self.experts_per_tok).reshape(bsz, seqlen, dim)
+    else:
+      thresh = logits.topk(self.experts_per_tok)[0][..., -1:]
+      weights = (logits >= thresh).where(logits, -float("inf")).softmax(-1)
+
+      out = None
+      for e in range(self.n_experts):
+        gu_q, gu_s = w_gate_up[e][:2*inter, :dim].contiguous(), w_gate_up_scale[e][:2*inter, :dim//32].contiguous()
+        dn_q, dn_s = w_down[e][:dim, :inter].contiguous(), w_down_scale[e][:dim, :inter//32].contiguous()
+        gate_up = matmul_mx(inp, gu_q, gu_s) + w_gate_up_bias[e]
+        y = (matmul_mx(swiglu(gate_up, self.swiglu_limit), dn_q, dn_s) + w_down_bias[e]).contiguous()
+        contrib = weights[..., e:e+1].cast(y.dtype) * y
+        out = contrib if out is None else out + contrib
     return out, [x_normed, rrms]
 
   @function(precompile=True, precompile_backward=True)
@@ -216,7 +264,11 @@ class GPTOSS:
                         w_down=self.w_down[i], w_down_scale=self.w_down_scale[i], w_down_bias=self.w_down_bias[i])
       h, *_ = self.run_layer(h, freqs_cis, mask_full, i % 2 == 0, attn_kwargs, ffn_kwargs, save=save)
 
-    logits = self.norm(h) @ self.output.T
+    h_normed = self.norm(h)
+    pad = (-self.dim) % 256
+    h_padded, w_padded = h_normed.pad((None, None, (0, pad))), self.output.pad(((0, 0), (0, pad)))
+    if ASM_GEMM and can_use_asm_gemm(h_padded, w_padded.T): logits = asm_gemm(h_padded, w_padded.T)
+    else: logits = h_normed @ self.output.T
     return logits
 
 def _get_pads(uop:UOp) -> list[UOp]:

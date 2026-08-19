@@ -1,7 +1,10 @@
 import unittest
 from tinygrad import Tensor, UOp, GlobalCounters, Context, Device
+import numpy as np
 from tinygrad.dtype import AddrSpace, dtypes, Invalid
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
+from tinygrad.renderer.ptx import PTXRenderer
+from test.helpers import assert_kernel_count, KernelCountException
 
 # **** kernels ****
 
@@ -187,6 +190,12 @@ class TestCustomKernel(unittest.TestCase):
     b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
     self.assertEqual(b.item(), 15)
 
+  def test_sum_outside(self):
+    a = Tensor([1.0, 2, 3, 4, 5])+1
+    tst = Tensor.empty(1)
+    b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
+    self.assertEqual(b.item(), 20)
+
   def test_sum_int(self):
     a = Tensor([1, 2, 3, 4, 5])
     tst = Tensor.empty(1, dtype=a.dtype)
@@ -274,7 +283,7 @@ class TestCustomKernel(unittest.TestCase):
 
     GlobalCounters.reset()
     out.realize()
-    self.assertEqual(GlobalCounters.kernel_count, 5)
+    assert_kernel_count(5)
 
   def test_simple_reshape(self):
     a = Tensor.ones(2,3,4).realize()
@@ -284,7 +293,7 @@ class TestCustomKernel(unittest.TestCase):
     GlobalCounters.reset()
     c.realize()
     assert all(i == 3. for i in c.flatten().tolist()), f"all 3 {c.tolist()}"
-    self.assertEqual(GlobalCounters.kernel_count, 3)
+    assert_kernel_count(2)
 
   def test_multi_after_schedule_order(self):
     """Test correct scheduling order when custom_kernel has multiple outputs.
@@ -334,12 +343,12 @@ class TestCustomKernel(unittest.TestCase):
     c = Tensor.custom_kernel(c, a, fxn=custom_add_one_kernel)[0]
     GlobalCounters.reset()
     c.realize()
-    self.assertEqual(GlobalCounters.kernel_count, len(devs))
+    assert_kernel_count(len(devs))
     self.assertTrue((c == 2).all().item())
 
   def test_partial_invalid_store_keeps_uncovered_reads(self):
     x = Tensor([10., 20., 30., 40.])
-    after = x.uop.after(x.uop.shrink(((0, 2),)).store(UOp.const(dtypes.float, Invalid, shape=(2,))))
+    after = x.uop.after(x.uop.shrink(((0, 2),)).store(Invalid))
     self.assertEqual(Tensor(after).contiguous().tolist(), [10., 20., 30., 40.])
 
   def test_multi_after_invalid_store_dep_removed(self):
@@ -399,13 +408,11 @@ class TestCustomKernel(unittest.TestCase):
     else: z = y.T.T+1
     GlobalCounters.reset()
     z.realize()
-    self.assertEqual(GlobalCounters.kernel_count, 2)
+    assert_kernel_count(2)
     self.assertEqual(z.tolist(), x.add(2).tolist())
 
-  @unittest.expectedFailure
   def test_custom_kernel_sched_copy(self): self.test_custom_kernel_sched(use_custom=True)
 
-  @unittest.expectedFailure
   def test_sliced_buffer_function(self):
     x = Tensor.arange(32).reshape(8, 4).clone().realize()
     from tinygrad import function
@@ -415,8 +422,8 @@ class TestCustomKernel(unittest.TestCase):
       return Tensor.custom_kernel(y, x, fxn=custom_add_one_kernel)[0]
     GlobalCounters.reset()
     y = run(x[0]).realize()
-    # it's copying the input and the output
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    # backends that support contiguous views don't launch extra kernels
+    assert_kernel_count(2 if x[0].uop.contiguous_view() is None else 1)
     self.assertEqual(y.tolist(), [1, 2, 3, 4])
 
   @Context(DEV="CPU")
@@ -426,11 +433,202 @@ class TestCustomKernel(unittest.TestCase):
     # TODO: it currently requires a compiler for Ops.BINARY
     from tinygrad.device import Device
     binary = Device[a.device].renderer.compiler.compile(src)
-    def custom_src_kernel(A:UOp) -> UOp:
+    def custom_src_kernel(A:UOp, B:UOp) -> UOp:
       sink = UOp.sink(A, arg=KernelInfo(name="test_src"))
       return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(sink.toposort())), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
-    a = Tensor.custom_kernel(a.reshape(2, 2).T, fxn=custom_src_kernel)[0]
-    self.assertEqual(a.tolist(), [[1, 2], [1, 3]])
+    a = Tensor.custom_kernel(a.reshape(2, 2).clone(), a.reshape(2, 2).T, fxn=custom_src_kernel)[0]
+    self.assertEqual(a.tolist(), [[1, 1], [2, 3]])
+
+  @Context(DEV="CPU")
+  def test_simple_from_source_alt(self):
+    a = Tensor.arange(4).clone().realize()
+    src = "void copy(int* restrict out, int* restrict in) { for (int i = 0; i < 4; i++) out[i] = in[i]; }"
+    from tinygrad.device import Device
+    binary = Device[a.device].renderer.compiler.compile(src)
+    def custom_src_kernel(out:UOp, inp:UOp) -> UOp:
+      sink = UOp.sink(out, inp, arg=KernelInfo(name="copy"))
+      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(sink.toposort())), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
+    out = Tensor.custom_kernel(Tensor.empty_like(a), a+1, fxn=custom_src_kernel)[0]
+    GlobalCounters.reset()
+    out.realize()
+    assert_kernel_count(2)
+    self.assertEqual(out.tolist(), [1, 2, 3, 4])
+
+  @unittest.skip("this shouldn't be expected to work")
+  def test_inplace_transpose(self):
+    def custom_assign_row_max_kernel(A:UOp) -> UOp:
+      row = UOp.range(A.shape[0], 0)
+      col = UOp.range(A.shape[1], 1)
+      return A[row, col].store(A[row].max(axis=0)).end(col).end(row).sink(arg=KernelInfo(name=f"assign_row_max_{A.numel()}"))
+    a = Tensor.arange(4).clone().realize()
+    a = Tensor.custom_kernel(a.reshape(2, 2).T, fxn=custom_assign_row_max_kernel)[0]
+    self.assertEqual(a.flatten().tolist(), [2, 2, 3, 3])
+    self.assertEqual(a.shape, (2, 2))
+
+class TestCustomKernelInput(unittest.TestCase):
+  def _test_mop(self, mop_fxn, max_kernels):
+    # default: input is BUFFER
+    x = mop_fxn(Tensor.arange(32).clone("CPU").realize())
+    y = Tensor.custom_kernel(Tensor.empty_like(x), x, fxn=custom_add_one_kernel)[0]
+    GlobalCounters.reset()
+    y.realize()
+    kernel_count = GlobalCounters.kernel_count
+    self.assertEqual(y.tolist(), x.add(1).tolist())
+    if kernel_count > max_kernels: raise KernelCountException(max_kernels, kernel_count)
+    # same test with @function, input is PARAM
+    from tinygrad import function
+    x0 = Tensor.arange(32).clone("CPU").realize()
+    @function(precompile=True)
+    def run(a:Tensor) -> Tensor:
+      xv = mop_fxn(a)
+      y = Tensor.invalids(*xv.shape, dtype=xv.dtype, device=a.device)
+      return Tensor.custom_kernel(y, xv, fxn=custom_add_one_kernel)[0]
+    GlobalCounters.reset()
+    y = run(x0).realize()
+    kernel_count = GlobalCounters.kernel_count
+    self.assertEqual(y.tolist(), mop_fxn(x0).add(1).tolist())
+    if kernel_count > max_kernels: raise KernelCountException(max_kernels, kernel_count)
+
+  def test_reshape(self): self._test_mop(lambda x: x.reshape(16, 2), max_kernels=2)
+  def test_permute(self): self._test_mop(lambda x: x.reshape(4, 8).T, max_kernels=3)
+  def test_double_permute(self): self._test_mop(lambda x: x.reshape(4, 8).T.T, max_kernels=2)
+  def test_shrink(self): self._test_mop(lambda x: x[:4], max_kernels=1)
+  def test_pad(self): self._test_mop(lambda x: x[:4].pad(((0, 4),)), max_kernels=2)
+  def test_flip(self): self._test_mop(lambda x: x.flip(0), max_kernels=2)
+  def test_offset_shrink(self): self._test_mop(lambda x: x[4:8], max_kernels=2)
+  def test_2d_shrink(self): self._test_mop(lambda x: x.reshape(4, 8)[:, 2:6], max_kernels=3)
+  def test_expand(self): self._test_mop(lambda x: x.reshape(16, 2)[:, :1].expand(16, 2), max_kernels=3)
+
+class TestUnshardIndex(unittest.TestCase):
+  """Regression tests for INDEX on UNSHARD (fragment) resolution in schedule/multi.py.
+
+  A fragment is a per-thread REG buffer wrapped in UNSHARD over LOCAL thread ranges.
+  index_multi must resolve an INDEX on the UNSHARD view into an INDEX on the per-thread
+  shard. Two ownership patterns must work:
+    contiguous: idx = rng*shard_sz + local   (thread rng owns [rng*shard_sz, ...))
+    strided:    idx = rng + ir*shard_sz      (thread rng owns {rng, rng+shard_sz, ...})
+  """
+  def _run(self, kernel, shape=(8, 8)):
+    c = Tensor.empty(*shape)
+    out = Tensor.custom_kernel(c, fxn=kernel)[0]
+    try: return out.numpy()
+    except RuntimeError as e:
+      if isinstance(Device[Device.DEFAULT].renderer, PTXRenderer) and "dynamic register indexing" in str(e):
+        self.skipTest("PTX does not support dynamic register indexing")
+      raise
+
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_contiguous_fragment_index(self):
+    # thread ty owns rows [ty*8, ty*8+8) of a 64-row fragment -- contiguous ownership.
+    # This is the pre-existing case that index_multi always handled.
+    def kernel(C:UOp) -> UOp:
+      ty = UOp.range(8, 0, AxisType.LOCAL)
+      ir = UOp.range(8, 1, AxisType.LOOP)
+      j = UOp.range(8, 2, AxisType.LOOP)
+      # 8x8 fragment, 8 threads -> 64x8 full tile. thread ty owns rows [ty*8, ty*8+8).
+      frag = UOp.placeholder((8, 8), dtypes.float32, 0, AddrSpace.REG).unshard((0,), (ty,))
+      return C[ty*8 + ir, j].store(frag[ty*8 + ir, j]).end(j, ir, ty).sink(arg=KernelInfo(name="contig_frag"))
+    out = self._run(kernel, (64, 8))
+    assert out.shape == (64, 8)
+
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_strided_fragment_index(self):
+    # thread ty owns rows {ty, ty+8, ty+16, ty+24, ..., ty+56} of a 64-row fragment --
+    # strided ownership. idx = ty + ir*8 where shard_sz=8 (8 threads, shard rows=8).
+    # The contiguous check (idx - rng*shard_sz) fails; the strided check
+    # (idx-rng) % shard_sz == 0 must succeed. This is the pattern the index_multi fix adds.
+    def kernel(C:UOp) -> UOp:
+      ty = UOp.range(8, 0, AxisType.LOCAL)
+      ir = UOp.range(8, 1, AxisType.LOOP)
+      j = UOp.range(8, 2, AxisType.LOOP)
+      # 8x8 fragment, 8 threads -> 64x8 full tile. thread ty owns rows {ty, ty+8, ..., ty+56}.
+      frag = UOp.placeholder((8, 8), dtypes.float32, 0, AddrSpace.REG).unshard((0,), (ty,))
+      return C[ty + ir*8, j].store(frag[ty + ir*8, j]).end(j, ir, ty).sink(arg=KernelInfo(name="strided_frag"))
+    out = self._run(kernel, (64, 8))
+    assert out.shape == (64, 8)
+
+  def test_fragment_index_cannot_shard(self):
+    # thread ty indexing rows [ty, ty+8) overlaps with other threads' rows -- this matches neither
+    # the contiguous nor the strided ownership pattern, so index_multi must raise.
+    def kernel(C:UOp) -> UOp:
+      ty = UOp.range(8, 0, AxisType.LOCAL)
+      ir = UOp.range(8, 1, AxisType.LOOP)
+      j = UOp.range(8, 2, AxisType.LOOP)
+      frag = UOp.placeholder((8, 8), dtypes.float32, 0, AddrSpace.REG).unshard((0,), (ty,))
+      return C[ty + ir, j].store(frag[ty + ir, j]).end(j, ir, ty).sink(arg=KernelInfo(name="bad_frag"))
+    with self.assertRaisesRegex(RuntimeError, "cannot shard index"):
+      self._run(kernel, (64, 8))
+
+def _run_fragment_kernel(testcase, kernel, out_shape, inputs=()):
+  c = Tensor.empty(*out_shape)
+  out = Tensor.custom_kernel(c, *inputs, fxn=kernel)[0]
+  try: return out.numpy()
+  except RuntimeError as e:
+    if isinstance(Device[Device.DEFAULT].renderer, PTXRenderer) and "dynamic register indexing" in str(e):
+      testcase.skipTest("PTX does not support dynamic register indexing")
+    raise
+
+class TestUnshardAlu(unittest.TestCase):
+  """Tests for ALU on (fragment) UNSHARD values in schedule/multi.py's alu_multi.
+
+  An ALU with UNSHARD srcs lowers to per-shard ops when every src is one of:
+    same sharding:  peel the UNSHARD, keep the layout
+    scalar:         broadcast to every shard
+    whole unsharded same-shape value: takes its per-shard sub-view (shard_subview)
+  """
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_alu_scalar_broadcast(self):
+    # scalar srcs broadcast to every shard: frag*2.0 where frag is 1.5 per thread -> 3.0 everywhere
+    def kernel(C:UOp) -> UOp:
+      ty = UOp.range(8, 0, AxisType.LOCAL)
+      # 8 values per thread, 8 threads -> 64-value full view
+      frag = UOp.placeholder((8,), dtypes.float32, 0, AddrSpace.LOCAL).unshard((0,), (ty,))
+      v = frag.after(frag.store(1.5)) * 2.0
+      return C.store(v).end(ty).sink(arg=KernelInfo(name="alu_scalar", opts_to_apply=()))
+    out = _run_fragment_kernel(self, kernel, (64,))
+    np.testing.assert_allclose(out, 3.0)
+
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_alu_whole_value_subview(self):
+    # UNSHARD + whole unsharded same-shape value: each shard adds its own sub-view of A.
+    def kernel(C:UOp, A:UOp) -> UOp:
+      ty = UOp.range(8, 0, AxisType.LOCAL)
+      frag = UOp.placeholder((8,), dtypes.float32, 0, AddrSpace.LOCAL).unshard((0,), (ty,))
+      v = frag.after(frag.store(0.0)) + A
+      return C.store(v).end(ty).sink(arg=KernelInfo(name="alu_subview", opts_to_apply=()))
+    a = Tensor(np.arange(64, dtype=np.float32))
+    out = _run_fragment_kernel(self, kernel, (64,), inputs=(a,))
+    np.testing.assert_allclose(out, a.numpy(), atol=1e-4)
+
+class TestUnshardStore(unittest.TestCase):
+  """Tests for STORE of a sharded value into an unsharded dest (store_value_multi in schedule/multi.py).
+
+  Every shard stores its value into its own contiguous sub-view of the dest, one SHRINK per sharded axis.
+  """
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_store_unshard_value(self):
+    # single-axis: 8 threads each own 8 values of the 64-value output tile
+    def kernel(C:UOp) -> UOp:
+      ty = UOp.range(8, 0, AxisType.LOCAL)
+      frag = UOp.placeholder((8,), dtypes.float32, 0, AddrSpace.LOCAL).unshard((0,), (ty,))
+      v = frag.after(frag.store(0.0)) + 2.5
+      return C.store(v).end(ty).sink(arg=KernelInfo(name="store_unshard", opts_to_apply=()))
+    out = _run_fragment_kernel(self, kernel, (64,))
+    np.testing.assert_allclose(out, 2.5)
+
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_store_unshard_value_2axis(self):
+    # two sharded axes (the gemm fragment layout): thread (ty, tx) owns the (2, 1, 1, 2) sub-view of the
+    # (2, 4, 2, 2) output tile; the store must SHRINK dest on both sharded axes
+    def kernel(C:UOp, A:UOp) -> UOp:
+      ty = UOp.range(4, 0, AxisType.LOCAL)
+      tx = UOp.range(2, 1, AxisType.LOCAL)
+      frag = UOp.placeholder((2, 1, 1, 2), dtypes.float32, 0, AddrSpace.REG).unshard((1, 2), (ty, tx))
+      v = frag.after(frag.store(0.0)) + A
+      return C.store(v).end(tx, ty).sink(arg=KernelInfo(name="store_unshard_2axis", opts_to_apply=()))
+    a = Tensor(np.arange(32, dtype=np.float32).reshape(2, 4, 2, 2))
+    out = _run_fragment_kernel(self, kernel, (2, 4, 2, 2), inputs=(a,))
+    np.testing.assert_allclose(out, a.numpy(), atol=1e-4)
 
 class TestUOpReduce(unittest.TestCase):
   def test_uop_sum(self):

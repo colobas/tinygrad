@@ -183,10 +183,11 @@ class SimpleTokenizer:
     toks = kv["tokenizer.ggml.tokens"]
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(toks))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
+    special_tokens_dict = dict(special_tokens)
     bos_id, eos_id = kv.get('tokenizer.ggml.bos_token_id'), kv.get('tokenizer.ggml.eos_token_id', 0)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"],
+    return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
       bos_id=bos_id if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=eos_id, eot_id=kv.get('tokenizer.ggml.eot_token_id'),
+      eos_id=eos_id, eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')),
       chat_template=kv.get('tokenizer.chat_template'),
       bos_token=toks[bos_id] if bos_id is not None else "", eos_token=toks[eos_id] if eos_id is not None else "")
 
@@ -270,7 +271,7 @@ class FallbackTemplate:
     if self.tok.preset == 'glm4': return ""
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
-  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True) -> str:
+  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
     for msg in messages:
       out += self.role(msg["role"])
@@ -634,9 +635,7 @@ def main():
 
   # warmup the JIT
   if args.warmup or args.serve:
-    # run 2 tokens through the model twice to capture the JIT before serving
-    with Context(DEBUG=max(DEBUG.value, 1)):
-      for _ in range(2): list(zip(range(2), model.generate([0])))
+    with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok).serve_forever()
