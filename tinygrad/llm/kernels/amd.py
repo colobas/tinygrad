@@ -357,7 +357,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   k, v = cache[0].reshape(B*H_KV, physical_n, cache_dim), cache[1].reshape(B*H_KV, physical_n, cache_dim)
   assert k.shape == v.shape and BH % k.shape[0] == 0 and k.shape[2] == D
   gqa_group = BH // k.shape[0]
-  if isinstance(M, int) and isinstance(valid_kv_len, int): assert M % BLOCK_M == 0 and valid_kv_len % BLOCK_N == 0
+  if isinstance(M, int): assert M % BLOCK_M == 0
+  # valid_kv_len only feeds q_base when q_start is None; with an explicit q_start (MTP verify / padded chunk) the KV
+  # length need not be BLOCK_N-aligned -- the causal mask (k_idx <= q_idx) masks reads past the last written position
+  if q_start is None and isinstance(valid_kv_len, int): assert valid_kv_len % BLOCK_N == 0
   assert isinstance(D, int) and D % WMMA_K == 0 and D % LANES_PER_WAVE_N == 0
   TM, TN, TD, SCALE = BLOCK_M//(WAVES_M*LANES_PER_WAVE_M), BLOCK_N//LANES_PER_WAVE_N, D//(WAVES_N*LANES_PER_WAVE_N), 1/math.sqrt(D)
   # query row 0 sits at sequence position q_base (the queries may be padded beyond valid_kv_len - q_base rows)
@@ -435,9 +438,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
-  if isinstance(T_real, UOp):
-    # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
-    T_pad = q.max_shape[2]
+  if isinstance(T_real, UOp) or T_real % BLOCK_M != 0:
+    # symbolic chunk, or a static T not aligned to BLOCK_M (e.g. an MTP verify window of K+1 draft tokens):
+    # pad the queries to the static tile; garbage rows are sliced off below
+    T_pad = q.max_shape[2] if isinstance(T_real, UOp) else ((T_real + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
     assert T_pad % BLOCK_M == 0, "chunk_size must be a multiple of 32"
     q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
   B, H, T, D = q.shape

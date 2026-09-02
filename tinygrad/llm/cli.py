@@ -141,6 +141,8 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--mtp", type=int, default=0, metavar="K",
+                       help="speculative-decode K tokens per iteration via the checkpoint's MTP head (0 disables, default behavior unchanged)")
   args = parser.parse_args()
 
   # load the model
@@ -175,9 +177,11 @@ def main():
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
 
+  generate = (lambda toks, **kw: model.generate_mtp(toks, args.mtp, **kw)) if args.mtp > 0 else model.generate
+
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=[tok.bos_id or 0])
+    gen = generate(toks:=[tok.bos_id or 0])
     for i in range(args.benchmark):
       profile_marker(f"decode @ {i}")
       GlobalCounters.reset()
@@ -197,7 +201,7 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    for next_id in model.generate(ids):
+    for next_id in generate(ids):
       if tok.is_end(next_id):
         sys.stdout.write(dec() + "\n\n")
         break
