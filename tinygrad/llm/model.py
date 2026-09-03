@@ -810,4 +810,4 @@ class Transformer:
 
     finally:  # the server abandons the generator at the stop token (GeneratorExit) -- print stats on any exit path
       if (total := sum(accept_hist)):
-        print(f"[mtp] accept_hist={accept_hist} mean_accept={sum(i*c for i,c in enumerate(accept_hist))/total:.3f} iters={total}")
+        print(f"[mtp] accept_hist={accept_hist} mean_accept={sum(i*c for i,c in enumerate(accept_hist))/total:.3f} iters={total}", flush=True)
