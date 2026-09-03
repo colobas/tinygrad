@@ -88,7 +88,8 @@ class Handler(HTTPRequestHandler):
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      gen_fn = (lambda t, **kw: model.generate_mtp(t, model.mtp_K, **kw)) if getattr(model, "mtp_K", 0) > 0 else model.generate
+      for next_id in gen_fn(ids, temperature=temperature):
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break

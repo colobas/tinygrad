@@ -506,6 +506,8 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
+    self.mtp_K = 0  # when >0, LLMServer routes generation through generate_mtp(K) (set from the --mtp CLI flag)
+    self._mtp_cache: tuple|None = None  # per-K MTP state: (K, commit jits, tok_buf, verify_buf, h_stage)
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -542,7 +544,10 @@ class Transformer:
     x = self._run_blocks(tokens, start_pos, verify=True)  # (B, N, D)
     logits = self.output(self.output_norm(x))             # (B, N, vocab)
     pred = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
-    return pred, x
+    # .clone(): x is consumed inside this traced function (by output_norm), so its buffer is a planner-owned
+    # intermediate that does NOT survive across JIT replays (is_realized goes False and any read re-runs the whole
+    # forward eagerly -- ~2350 kernels). the clone is a pure output buffer the JIT writes every replay.
+    return pred, x.clone()
 
   def _mtp_draft_step(self, tok:Tensor, h_prev:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
     """one MTP head step: embed `tok`, combine with `h_prev`, run the head block, sample the next draft token."""
@@ -550,7 +555,7 @@ class Transformer:
     h = self.mtp_heads[0](h_prev, tok_embed, start_pos)
     logits = self.output(self.mtp_heads[0].shared_head_norm(h))[:, -1, :]
     samp = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
-    return samp, h
+    return samp, h.clone()  # see forward_verify: h is an internal intermediate, clone() makes it a stable JIT output
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -657,6 +662,9 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    if self.mtp_K > 0:  # capture the MTP jits (verify/draft/commits) too: they'd otherwise stall the first request
+      for _ in range(3): list(zip(range(2 * (self.mtp_K + 1)), self.generate_mtp([0], self.mtp_K)))
+      self._cached_tokens = []
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -705,54 +713,78 @@ class Transformer:
 
     # prefill exactly like generate(), but keep the pre-output_norm hidden state of the last processed position --
     # that seeds the first MTP draft head call
-    # prefill all but the last prompt token: verify window position 0 IS last_committed and re-absorbs it, so the
+    # prefill all but the last prompt token THROUGH THE SHARED PREFILL JIT (self.__call__ -> prefill_jit; the eager
+    # _run_blocks path is ~10s/chunk on USB4). verify window position 0 IS last_committed and re-absorbs it, so the
     # committed state entering verify must exclude it (else it's double-counted in the SSM recurrence AND written to
-    # the KV cache one position too late). the last prompt token is carried as last_committed. hidden ends up as the
-    # trunk state at position prompt_len-2 -- exactly the h_prev seed the first draft head call needs.
-    hidden = None
+    # the KV cache one position too late); the last prompt token is carried as last_committed. prefill_jit only
+    # returns the sampled token, so h_prev is seeded with zeros -- that just degrades draft quality for the FIRST
+    # iteration (more rejects that round), never correctness: verify recomputes the true hidden and reseeds h_prev.
     while start_pos < prompt_len - 1:
       n_toks = min(chunk_size, prompt_len - 1 - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      hidden = self._run_blocks(t[:, sp:sp+nt], sp).realize()
+      self(t[:, sp:sp+nt], sp, temp).realize()
       start_pos += n_toks
-    # .contiguous().realize() normalizes the view to a bare buffer -- h_prev otherwise carries a slice ShapeTracker
-    # whose Python-int offset would make mtp_draft_jit's captured input signature mismatch across iterations.
-    # when there's nothing to prefill (1-token prompt, or a continuation where state is already cached), there's no
-    # valid h_prev position -- seed with zeros. this only degrades iteration-1 draft quality (-> more rejects that
-    # round), never correctness: verify always recomputes the true hidden and reseeds h_prev from vhidden after.
-    h_prev = hidden[:, -1:].contiguous().realize() if hidden is not None else \
-      Tensor.zeros(1, 1, self.token_embd.weight.shape[1], device=self.token_embd.weight.device).contiguous().realize()
+    h_prev = Tensor.zeros(1, 1, self.token_embd.weight.shape[1], device=self.token_embd.weight.device).contiguous().realize()
     last_committed = tokens[-1]
 
-    # pre-allocated device buffers for the per-iteration token inputs -- copyin() writes raw bytes directly into an
-    # already-realized buffer, skipping Tensor(python_list) construction (~30ms/call on AMD, see
-    # tmp/qwen_mtp_ssm-more_than_you_wanted_to_know.md Update 5) entirely. dtype/shape stay fixed for the whole run
-    # (K is static), so these buffers -- and the JIT captures that read them -- are reused across every iteration.
+    # per-K MTP state is created ONCE and cached on the model: the staging buffers feed the JIT captures (which bind
+    # to these exact buffers), and each TinyJit capture allocates HCQ graphs whose pinned-sysmem daemon slots are
+    # never freed (extra/usbgpu server.c MAX_SYSMEM=128, g_sysmem_count only grows) -- per-request creation both
+    # re-pays the capture cost every request and exhausts the daemon after a dozen requests.
     device = self.token_embd.weight.device
-    tok_buf = Tensor.zeros(1, 1, dtype="int32", device=device).contiguous().realize()
-    verify_buf = Tensor.zeros(1, K + 1, dtype="int32", device=device).contiguous().realize()
+    if self._mtp_cache is None or self._mtp_cache[0] != K:
+      # commit is JIT'd per accept value: `accept` only takes K+1 values and commit_verify needs it as a plain int (it
+      # drives a static conv-window slice), so instead of a symbolic-accept rewrite we bake one capture per value.
+      # every buffer commit touches (_verify_* stashes, recurrent_state, conv_state) is persistent, so each replay
+      # reads the fresh stash contents -- same pattern as the KV cache in the baseline decode JIT.
+      def _commit_all(accept:int) -> None:
+        stores = [s for b in ssm_blocks for s in b.commit_verify(accept)]
+        if stores: Tensor.realize(*[Tensor(s) for s in stores])
+      # pre-allocated device buffers for the per-iteration token inputs -- copyin() writes raw bytes directly into an
+      # already-realized buffer, skipping Tensor(python_list) construction (~30ms/call on AMD) entirely. h_stage is
+      # the fixed staging buffer for the draft head's hidden input: the draft chain would otherwise feed the JIT's
+      # own cloned output back in as the next step's input, whose signature differs from h_prev's (JitError args
+      # mismatch at K>=2). copying every source into ONE persistent buffer keeps mtp_draft_jit's signature constant.
+      self._mtp_cache = (K, [TinyJit(functools.partial(_commit_all, a)) for a in range(K + 1)],
+                         Tensor.zeros(1, 1, dtype="int32", device=device).contiguous().realize(),
+                         Tensor.zeros(1, K + 1, dtype="int32", device=device).contiguous().realize(),
+                         Tensor.zeros(*h_prev.shape, device=device).contiguous().realize())
+    _, commit_jits, tok_buf, verify_buf, h_stage = self._mtp_cache
     tok_stage = array.array('i', [0])
     verify_stage = array.array('i', [0] * (K + 1))
+    hidden_dim = int(h_prev.shape[-1])
+    h_bytes = bytearray(hidden_dim * 4)  # one position of float32 hidden state, host-side
 
     def _copyin(buf:Tensor, stage:array.array) -> None:
       b = buf.uop.buffer
       assert isinstance(b, Buffer), "mtp draft/verify token buffers are never multi-device"
       b.allocator._copyin(b._buf, memoryview(stage))
 
+    def _bufof(t:Tensor) -> Buffer:
+      b = t.uop.base.buffer
+      assert isinstance(b, Buffer), "mtp hidden-state buffers are never multi-device"
+      return b
+
+    def _read_hidden(t:Tensor, pos:int) -> None:  # h_bytes = t[0, pos, :] (t is a realized (1, P, hidden_dim) f32 buffer)
+      b = _bufof(t)
+      full = bytearray(b.nbytes)
+      b.allocator._copyout(memoryview(full), b._buf)
+      h_bytes[:] = full[pos*len(h_bytes):(pos+1)*len(h_bytes)]
+
+    _read_hidden(h_prev, 0)
+
     while len(tokens) < self.max_context - K - 1:
       drafts: list[int] = []
-      cur_tok, cur_h = last_committed, h_prev
+      cur_tok = last_committed
       for i in range(K):
         tok_stage[0] = cur_tok
         _copyin(tok_buf, tok_stage)
-        samp, cur_h = self.mtp_draft_jit(tok_buf, cur_h, v_start_pos.bind(start_pos + i), temp)
-        # cur_h comes back as a GETTUPLE(CALL(...)) result (the @function-decorated block's return convention) --
-        # it still carries the just-used start_pos bind symbolically. Feeding it straight back as next iteration's
-        # h_prev would pull that stale bind into the next call's schedule alongside the new one and raise "bind
-        # mismatch" in create_linear_with_vars. .contiguous().realize() collapses it to a bare buffer first.
-        cur_h = cur_h.contiguous().realize()
+        b = _bufof(h_stage)
+        b.allocator._copyin(b._buf, memoryview(h_bytes))
+        samp, cur_h = self.mtp_draft_jit(tok_buf, h_stage, v_start_pos.bind(start_pos + i), temp)
         cur_tok = int(samp.item())
         drafts.append(cur_tok)
+        if i < K - 1: _read_hidden(cur_h, 0)  # chain: next step's hidden input is this step's head output
 
       verify_stage[0] = last_committed
       for i, d in enumerate(drafts): verify_stage[i + 1] = d
@@ -764,15 +796,14 @@ class Transformer:
       committed = drafts[:accept] + [pred_list[accept]]
       accept_hist[accept] += 1
 
-      # bundle every SSM block's state-write into ONE realize -- a per-block realize is a full USB4 host round-trip
-      commit_stores = [s for b in ssm_blocks for s in b.commit_verify(accept)]
-      if commit_stores: Tensor.realize(*[Tensor(s) for s in commit_stores])
+      # bundle every SSM block's state-write into ONE realize (and, once captured, one JIT graph replay)
+      if ssm_blocks: commit_jits[accept]()
 
       tokens.extend(committed)
       start_pos += accept + 1
-      # see the .contiguous().realize() note above: normalize the accept-offset slice before it becomes next
-      # iteration's mtp_draft_jit h_prev input
-      h_prev, last_committed = vhidden[:, accept:accept+1].contiguous().realize(), committed[-1]
+      # seed the next round's draft chain: h_bytes = vhidden[0, accept, :] via a raw 40KB copyout (no eager slice kernel)
+      _read_hidden(vhidden, accept)
+      last_committed = committed[-1]
       self._cached_tokens = tokens[:-1]
       for tk in committed: yield tk
 

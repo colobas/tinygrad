@@ -140,14 +140,32 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = (group_count+31)//32
-  token_output_chunk, lane = UOp.range(out.shape[0]*out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
-  token, output, chunk = token_output_chunk // (out_features*chunks), (token_output_chunk//chunks) % out_features, token_output_chunk % chunks
+  tokens = out.shape[0]
+  assert isinstance(tokens, int), "decode linear needs a static token count"
+  if tokens > 8:  # plenty of grid parallelism; keep one token per workitem
+    token_output_chunk, lane = UOp.range(tokens*out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+    token, output, chunk = token_output_chunk // (out_features*chunks), (token_output_chunk//chunks) % out_features, token_output_chunk % chunks
+    group = lane+chunk*32
+    value = group_dot(token, output, group) if group_count % 32 == 0 else \
+      (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True)
+    return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output_chunk, lane).sink(
+      arg=KernelInfo(name=name, opts_to_apply=()))
+  # small static token count (single decode step or an MTP verify window): loop tokens INSIDE the workitem. the
+  # weight-load UOps carry no token dependence, so they are hash-consed across the unrolled loop and each weight
+  # word is fetched from DRAM once for all tokens (the per-token grid re-reads the whole weight matrix per token --
+  # 2-4x the memory traffic, and these loads are nontemporal so the cache doesn't save you).
+  output_chunk, lane = UOp.range(out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  output, chunk = output_chunk // chunks, output_chunk % chunks
   group = lane+chunk*32
-  value = group_dot(token, output, group) if group_count % 32 == 0 else \
-    (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output_chunk, lane).sink(
-    arg=KernelInfo(name=name, opts_to_apply=()))
+  stores = []
+  for t in range(tokens):
+    tok = UOp.const(t, dtypes.int)
+    value = group_dot(tok, output, group) if group_count % 32 == 0 else \
+      (group < group_count).where(group_dot(tok, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True)
+    stores.append(out[tok, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
+  return UOp.group(*stores).end(output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:

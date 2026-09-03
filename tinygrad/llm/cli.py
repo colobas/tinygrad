@@ -170,6 +170,8 @@ def main():
       template = env.from_string(ct)
     except ImportError: print("warning: jinja2 is not installed, the model's chat template is disabled")
 
+  model.mtp_K = args.mtp  # LLMServer checks this to route through generate_mtp
+
   # warmup the JIT
   if args.warmup or args.serve:
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
