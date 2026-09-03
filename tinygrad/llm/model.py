@@ -773,7 +773,8 @@ class Transformer:
 
     _read_hidden(h_prev, 0)
 
-    while len(tokens) < self.max_context - K - 1:
+    try:
+     while len(tokens) < self.max_context - K - 1:
       drafts: list[int] = []
       cur_tok = last_committed
       for i in range(K):
@@ -807,5 +808,6 @@ class Transformer:
       self._cached_tokens = tokens[:-1]
       for tk in committed: yield tk
 
-    total = sum(accept_hist)
-    if total: print(f"[mtp] accept_hist={accept_hist} mean_accept={sum(i*c for i,c in enumerate(accept_hist))/total:.3f} iters={total}")
+    finally:  # the server abandons the generator at the stop token (GeneratorExit) -- print stats on any exit path
+      if (total := sum(accept_hist)):
+        print(f"[mtp] accept_hist={accept_hist} mean_accept={sum(i*c for i,c in enumerate(accept_hist))/total:.3f} iters={total}")
