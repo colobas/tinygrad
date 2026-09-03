@@ -100,12 +100,11 @@ class Linear(nn.Linear):
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
-  # int8 4-wide dot, widened to scalar multiply-adds (2% decode slower than the sudot4 builtin, but portable)
-  for i in range(4):
-    av = ((a >> (8*i)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).int()
-    bv = ((b >> (8*i)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8).int()
-    c = c + av*bv
-  return c
+  # int8 4-wide dot via the sudot4 builtin. upstream uses portable scalar multiply-adds ("2% decode slower") --
+  # fine at T=1 where the kernel is memory-bound, but the small-T weight-reuse path in _decode_linear multiplies
+  # the ALU work by the token count while weight traffic stays 1x, and the scalar expansion (16 ops per dot) makes
+  # a T=3 MTP verify ALU-bound (~10ms/iter slower). RDNA3 has the instruction; use it.
+  return UOp(Ops.CUSTOMI, src=(a.int(), b.int(), c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
 
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg=("__builtin_amdgcn_perm({}, {}, {})", dtypes.uint32))
