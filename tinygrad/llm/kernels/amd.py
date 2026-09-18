@@ -69,6 +69,9 @@ class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
   shard_axis:int|None = None
+  # optional activation-side transform applied before the matmul (e.g. the Hadamard rotation folded into PrismML Bonsai weights).
+  # a plain callable (not a Tensor) so nn.state.get_state_dict does not pick it up as a parameter
+  pre_transform:Callable[[Tensor], Tensor]|None = None
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
@@ -101,6 +104,7 @@ class Linear(nn.Linear):
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
+    if self.pre_transform is not None: x = self.pre_transform(x)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
