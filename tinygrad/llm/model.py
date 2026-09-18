@@ -4,7 +4,7 @@ from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, _q8_memo
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, PQ2_0
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -544,7 +544,8 @@ class Transformer:
     self.embed_transform:Callable[[Tensor], Tensor]|None = None  # inverse Hadamard for rotated (Bonsai) embedding tables
     self.mtp_K = 0  # when >0, LLMServer routes generation through generate_mtp(K) (set from the --mtp CLI flag)
     # prompt tokens per prefill forward. the quant WMMA kernels stream the weights once per chunk, so bigger chunks amortize weight
-    # traffic (32 -> 64 is +30% prefill on bonsai2:27b, 128 is flat). fixed per process: the prefill JIT binds this as the toks range
+    # traffic (bonsai2:27b PQ2_0: 32/64/128 tokens -> 404/796/933 tok/s; the f16 WMMA path of IQ4_XS peaks at 64). from_gguf picks
+    # per quant type; fixed per process since the prefill JIT binds it as the toks range
     self.prefill_chunk = 64
     self._mtp_cache: tuple|None = None  # per-K MTP state: (K, commit jits, tok_buf, verify_buf, h_stage)
     # we specialize the JIT for prefill and rollout
@@ -565,7 +566,7 @@ class Transformer:
     return self.embed_transform(x) if self.embed_transform is not None else x
 
   def _run_blocks(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
-    _q8_memo.clear()  # per-forward memo of shared q8 activation quantizations (see kernels/amd.py q8_quantize)
+    clear_activation_memos()  # per-forward memos of shared q8 activation quantizations (see kernels/amd.py q8_quantize)
     x = self.embed(tokens)                                # (B, T, D)
     for block in self.blk: x = block(x, start_pos, verify=verify)
     return x
@@ -595,7 +596,7 @@ class Transformer:
 
   def _mtp_draft_step(self, tok:Tensor, h_prev:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
     """one MTP head step: embed `tok`, combine with `h_prev`, run the head block, sample the next draft token."""
-    _q8_memo.clear()
+    clear_activation_memos()
     tok_embed = self.embed(tok)
     h = self.mtp_heads[0](h_prev, tok_embed, start_pos)
     logits = self.output(self.mtp_heads[0].shared_head_norm(h))[:, -1, :]
@@ -706,6 +707,7 @@ class Transformer:
       for lin in model.linears():
         lin.set_quantized(lin.weight)
         if lin.ggml_type is not None: lin.weight.realize()
+      if any(lin.ggml_type == PQ2_0 for lin in model.linears()): model.prefill_chunk = 128  # int8 WMMA prefill is not weight-bound
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

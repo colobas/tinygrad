@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod
+from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -18,6 +18,7 @@ Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes 
 # 2-byte aligned, so set_quantized re-packs each into 9 words: [scale][8 code words], with the 16 codes of every word transposed so
 # that (word >> 2k) & 0x03030303 yields the 4 consecutive weights 4k..4k+3 as int8 lanes (one shift+and per dp4a operand)
 PQ2_0, PQ2_BYTES, PQ2_BLOCK, PQ2_WORDS = 142, 34, 128, 9
+PQ2_I8_WMMA = bool(getenv("PQ2_I8_WMMA", 1))  # int8 tensor-core prefill for PQ2_0 (0: f16 WMMA path)
 QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4, PQ2_0: PQ2_BYTES*2}  # bytes per 256-weight block
 BLOCK_BYTES = {**QUANT_SIZES, PQ2_0: PQ2_BYTES}  # ggml_data_to_tensor's per-block reshape width
 
@@ -307,7 +308,7 @@ def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   tokens = tuple(tuple(token_block*token_tile + tile*16 + half*8 + i for i in range(8)) for tile in range(token_tile//16))
   return output_waves, token_block, output_block, lane, wave, half, outputs, inputs, tokens
 
-def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves):
+def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves, ksplit:UOp|None=None):
   # the accumulator fragment halves are exchanged between lane pairs (l, l^16) through LDS (a ds_swizzle without CUSTOM)
   flat_accs = [acc for output_accs in accs for acc in output_accs]
   lds = UOp.placeholder((output_waves, 32, len(flat_accs)*8), dtypes.float32, slot=33, addrspace=AddrSpace.LOCAL)
@@ -319,7 +320,8 @@ def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_wa
     low = half.eq(0)
     return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
   tt = len(tokens)
-  return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
+  return [(out[token, output] if ksplit is None else out[token, output, ksplit]).store(value)
+          for ot,(output,output_accs) in enumerate(zip(outputs, accs))
           for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(ot*tt+tile))]
 
 def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name):
@@ -373,6 +375,73 @@ def _pq2_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fe
   return _quant_linear_wmma(out, x, out_features, in_features, 2*PQ2_WORDS, _wmma_layout(out, out_features, token_tile, output_tiles),
                             dequant, "linear_pq2_0_f16_wmma")
 
+def _pq2_i8_tiling(tokens:int, out_features:int, in_features:int) -> tuple[int, int, int]:
+  # (token_tile, output_tiles, ksplit). measured on a 7900XTX: 64-token tiles with one 16-output tile per wave and no split-K is
+  # best or tied for every shape (the kernel is bound by activation-fragment traffic, not by occupancy: split-K and smaller tiles,
+  # which add waves, did not help). PQ2_I8_TILING=tt,ot,ks overrides for experiments
+  if (cfg := getenv("PQ2_I8_TILING", "")): tt, ot, ks = (int(v) for v in cfg.split(","))
+  else: tt, ot, ks = 64, 1, 1
+  tt = min(tt, tokens) if tokens % tt else tt
+  while tokens % tt: tt //= 2
+  n_blocks = in_features // PQ2_BLOCK
+  while n_blocks % ks: ks //= 2
+  return tt, ot, ks
+
+@functools.cache
+def _pq2_linear_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xs:UOp, out_features:int, in_features:int) -> UOp:
+  # int8 tensor-core prefill: the activations are int8 with one scale per token per 128-block (same blocking as the weights), so a
+  # whole 128-block (8 K-steps) accumulates in int32 and is rescaled once. the 2-bit codes need only shift+and+byte_perm to become
+  # int8 lanes ({-1,0,1,2}), vs ~5 VALU ops per weight for the f16 dequant. B fragments are shared by all token tiles
+  token_tile, output_tiles, ksplit = _pq2_i8_tiling(cast(int, out.shape[0]), out_features, in_features)
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles)
+  output_waves, token_block, output_block, lane, wave, physical_half, outputs, input_tokens, tokens = layout
+  n_blocks, tt = in_features // PQ2_BLOCK // ksplit, token_tile // 16
+  ks = UOp.range(ksplit, 5, AxisType.GLOBAL)
+  accs = tuple(tuple(UOp.placeholder((8,), dtypes.float32, slot=ot*tt+tile, addrspace=AddrSpace.REG) for tile in range(tt))
+               for ot in range(output_tiles))
+  accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in output_accs) for output_accs in accs)
+  block_r = UOp.range(n_blocks, 4, AxisType.REDUCE)
+  block, all_blocks = ks*n_blocks + block_r, in_features // PQ2_BLOCK
+  code_table = UOp.const(0x020100ff, dtypes.uint32)  # byte_perm LUT: code 0,1,2,3 -> int8 -1,0,1,2
+  int_accs = [[UOp.stack(*(UOp.const(0, dtypes.int32),)*8)]*tt for _ in range(output_tiles)]
+  def int8x16(words:tuple[UOp, ...]) -> UOp:  # 4 u32 -> 16 int8 lanes (byte extraction; clang folds it back into the registers)
+    return UOp.stack(*(((w >> (8*b)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8) for w in words for b in range(4)))
+  for kstep in range(8):
+    # xq is the int8 activation matrix viewed as u32 words: int8 loads are never coalesced, u32 loads become one 16-byte load
+    aw = tuple(_amd_load(xq[input_token, (block*PQ2_BLOCK + kstep*16)//4], 4) for input_token in input_tokens)
+    afrags = tuple(int8x16(tuple(w[i] for i in range(4))) for w in aw)
+    for ot, output in enumerate(outputs):
+      word = raw[(output*all_blocks + block)*PQ2_WORDS + 1 + kstep]
+      bfrag = int8x16(tuple(_amd_byte_perm(UOp.const(0, dtypes.uint32), code_table, (word >> (2*k)) & 0x03030303) for k in range(4)))
+      for tile, afrag in enumerate(afrags):
+        int_accs[ot][tile] = UOp.wmma(afrag, bfrag, int_accs[ot][tile], *WMMA_ARG)
+  updates = []
+  for ot, output in enumerate(outputs):
+    d = _half(raw[(output*all_blocks + block)*PQ2_WORDS] & 0xffff)
+    for tile in range(tt):
+      prev = accs[ot][tile].after(block_r)
+      # physical C-fragment layout: element i of a lane in wave-half h is row 2i+h (the LDS exchange in _wmma_stores un-interleaves it)
+      vals = tuple(prev[i].load() + int_accs[ot][tile][i].cast(dtypes.float32) *
+                   (xs[token_block*token_tile + tile*16 + 2*i + physical_half, block] * d) for i in range(8))
+      updates.append(accs[ot][tile].store(UOp.stack(*vals)))
+  update = UOp.group(*updates).end(block_r)
+  stores = _wmma_stores(out, outputs, tokens, accs, update, physical_half, lane, wave, output_waves, ksplit=ks)
+  return UOp.group(*stores).end(token_block, output_block, ks, lane, wave).sink(arg=KernelInfo(name="linear_pq2_0_i8_wmma", opts_to_apply=()))
+
+def q8_block_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  # int8 activations with one scale per token per 128-block, for the int8 WMMA prefill (memoized like q8_quantize)
+  if (memo := _q8_block_memo.get(x.uop)) is not None: return memo
+  xr = x.reshape(tokens, in_features // PQ2_BLOCK, PQ2_BLOCK).float()
+  scale = (xr.abs().max(-1, keepdim=True) / 127).maximum(1e-8)
+  xq = (xr / scale).round().clip(-127, 127).cast(dtypes.int8).reshape(tokens, in_features).contiguous()
+  _q8_block_memo[x.uop] = ret = (xq, scale.reshape(tokens, in_features // PQ2_BLOCK).contiguous())
+  return ret
+_q8_block_memo:dict[UOp, tuple[Tensor, Tensor]] = {}
+
+def clear_activation_memos() -> None:
+  _q8_memo.clear()
+  _q8_block_memo.clear()
+
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int) -> UOp:
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
@@ -411,6 +480,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
+  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type == PQ2_0 and in_features % PQ2_BLOCK == 0 and PQ2_I8_WMMA:
+    xq8, xs8 = q8_block_quantize(x, tokens, in_features)
+    out = Tensor.empty(tokens, out_features, _pq2_i8_tiling(tokens, out_features, in_features)[2], dtype=dtypes.float32, device=x.device).uop
+    return run(_pq2_linear_i8_wmma_kernel, out, raw, xq8.bitcast(dtypes.uint32).uop, xs8.uop)
   if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS, PQ2_0) and in_features % GGML_BLOCK_SIZE == 0:
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else _pq2_linear_f16_wmma_kernel if layer.ggml_type == PQ2_0 else \
       functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)

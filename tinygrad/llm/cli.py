@@ -153,7 +153,7 @@ def main():
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   parser.add_argument("--mtp", type=int, default=0, metavar="K",
                        help="speculative-decode K tokens per iteration via the checkpoint's MTP head (0 disables, default behavior unchanged)")
-  parser.add_argument("--prefill_chunk", type=int, default=64, help="prompt tokens per prefill forward (default 64)")
+  parser.add_argument("--prefill_chunk", type=int, default=None, help="prompt tokens per prefill forward (default: per quant type, 64 or 128)")
   parser.add_argument("--no_chat_template", action="store_true", help="Don't use the model's chat template, always use the fallback template")
   args = parser.parse_args()
 
@@ -183,7 +183,7 @@ def main():
     except ImportError: print("warning: jinja2 is not installed, the model's chat template is disabled")
 
   model.mtp_K = args.mtp  # LLMServer checks this to route through generate_mtp
-  model.prefill_chunk = args.prefill_chunk
+  if args.prefill_chunk is not None: model.prefill_chunk = args.prefill_chunk
 
   # warmup the JIT
   if args.warmup or args.serve:
