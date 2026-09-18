@@ -4,7 +4,7 @@ from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, _q8_memo
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -552,6 +552,7 @@ class Transformer:
     return self.embed_transform(x) if self.embed_transform is not None else x
 
   def _run_blocks(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
+    _q8_memo.clear()  # per-forward memo of shared q8 activation quantizations (see kernels/amd.py q8_quantize)
     x = self.embed(tokens)                                # (B, T, D)
     for block in self.blk: x = block(x, start_pos, verify=verify)
     return x
@@ -581,6 +582,7 @@ class Transformer:
 
   def _mtp_draft_step(self, tok:Tensor, h_prev:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
     """one MTP head step: embed `tok`, combine with `h_prev`, run the head block, sample the next draft token."""
+    _q8_memo.clear()
     tok_embed = self.embed(tok)
     h = self.mtp_heads[0](h_prev, tok_embed, start_pos)
     logits = self.output(self.mtp_heads[0].shared_head_norm(h))[:, -1, :]

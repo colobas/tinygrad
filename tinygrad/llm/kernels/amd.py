@@ -186,7 +186,16 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
                         store_half.eq(0).where(gsum[0].float(), gsum[1].float()))))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
+_q8_memo:dict[UOp, tuple[Tensor, Tensor, Tensor]] = {}
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+  # linears fed by the same activation (attn q/k/v, ffn gate/up) share one quantize launch: the UOp graph is hash-consed, so an
+  # identical input is the same UOp object. the memo is scoped to one forward pass (Transformer._run_blocks clears it): a hit
+  # from an earlier trace would return already-realized tensors and the JIT would capture a graph without the quantize kernel
+  if (memo := _q8_memo.get(x.uop)) is not None: return memo
+  _q8_memo[x.uop] = ret = _q8_quantize(x, tokens, in_features)
+  return ret
+
+def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
