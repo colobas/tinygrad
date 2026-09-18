@@ -20,7 +20,7 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                10:(256,84), 11:(256,110), 12:(256,144), 13:(256,176), 14:(256,210),
                16:(256,66), 17:(256,74), 18:(256,98), 19:(256,50), 20:(32,18), 21:(256,110), 22:(256,82), 23:(256,136),
-               29:(256,56), 39:(32,17), 41:(128,18)}
+               29:(256,56), 39:(32,17), 41:(128,18), 42:(64,18), 142:(128,34), 143:(128,28)}
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -31,7 +31,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q5_0 (id: 6),
   Q5_1 (id: 7), Q8_0 (id: 8), Q2_K (id: 10), Q3_K (id: 11), Q4_K (id: 12), Q5_K (id: 13),
   Q6_K (id: 14), IQ2_XXS (id: 16), IQ2_XS (id: 17), IQ3_XXS (id: 18), IQ1_S (id: 19),
-  IQ4_NL (id: 20), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23), IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41)
+  IQ4_NL (id: 20), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23), IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41),
+  Q2_0 (id: 42), PQ2_0 (id: 142), PTQ1_0 (id: 143)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
@@ -181,6 +182,22 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       d = blocks[:,:2].bitcast(dtypes.float16)
       bits = q_to_uint8(blocks[:,2:], 1).reshape(-1, 8, 16).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
       return d * (bits * 2 - 1)
+    # Q2_0 (64 elements, 18 bytes) / PQ2_0 (PrismML, 128 elements, 34 bytes): d:2, then 2-bit codes 00=-1 01=0 10=+1 11=+2
+    # element j lives in byte j//4 at bit offset 2*(j%4) (byte-sequential, unlike the nibble-plane layout q_to_uint8 produces)
+    if ggml_type in (42, 142):
+      d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
+      codes = blocks[:,2:].unsqueeze(-1).div(Tensor.const((1, 4, 16, 64), dtypes.uint8), rounding_mode="trunc").bitwise_and(3).flatten(-2)
+      return d * (codes.cast(dtypes.int8) - 1)
+    # PTQ1_0 (PrismML ternary, 128 elements, 28 bytes): qs:24 (5 trits/byte, base-3 packed), qh:2 (4 trits/byte), d:2 (last).
+    # decode order follows dequantize_row_ptq1_0: qs in stages of 16 then 8 bytes (trit-major within a stage), then qh
+    if ggml_type == 143:
+      d = blocks[:,26:28].bitcast(dtypes.float16).cast(dtypes.float32)
+      def trits(q:Tensor, n:int) -> Tensor:  # trit index n of each base-3 packed byte: ((q * 3**n) & 0xff) * 3 >> 8 in {0,1,2}
+        pow3 = Tensor.const(tuple(3**i for i in range(n)), dtypes.int32)
+        return (((q.cast(dtypes.int32).unsqueeze(-1) * pow3) & 0xff) * 3 >> 8).transpose(-1, -2).flatten(-2)
+      qs = blocks[:,:24].cast(dtypes.uint8)
+      vals = trits(qs[:,:16], 5).cat(trits(qs[:,16:24], 5), trits(blocks[:,24:26], 4), dim=-1)
+      return d * (vals - 1).cast(dtypes.float32)
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 def _read_unpack(fmt: str, n: int, r:io.BufferedIOBase): return struct.unpack(fmt, r.read(n))[0]

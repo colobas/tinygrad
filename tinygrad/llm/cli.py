@@ -94,8 +94,11 @@ models = {
   "qwen3.5:4b": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
   "qwen3.5:9b": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
   "qwen3.5:27b-uncensored": "https://huggingface.co/HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-  # ships with an embedded trailing MTP block (nextn_predict_layers); loader drops it and serves the base model, no spec decode
+  # ships with an embedded trailing MTP block (nextn_predict_layers): pass --mtp K to speculative-decode with it
   "qwen3.8:27b-uncensored": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf",
+  # PrismML Ternary Bonsai 2 (Qwen3.8-27B backbone, ternary g128 weights, Hadamard-rotated basis). PQ2_0: 2-bit slots, 7.2GB. PTQ1_0: dense trits, 5.9GB
+  "bonsai2:27b": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "bonsai2:27b-ptq1": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
   "qwen3.6:27b": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
   "qwen3.6:35b-a3b": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
   # pinned to the last revision with the plain IQ4_XS quant: the UD replacement uses Q3_K tensors the loader doesn't support

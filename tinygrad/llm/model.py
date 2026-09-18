@@ -1,6 +1,6 @@
 from __future__ import annotations
 import array, enum, functools, itertools, pathlib
-from typing import cast
+from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
@@ -33,6 +33,31 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+
+# ******** PrismML Bonsai: blockwise Hadamard rotation folded into the (ternary) weights ********
+# the stored weight is W' = W @ R^T with R = H_b(blockwise, normalized Sylvester) @ diag(signs) on the input dimension, so the
+# runtime applies x' = H_b(x * signs) before every folded matmul. H_b is symmetric orthogonal, so the token-embedding table
+# (stored rotated, consumed by row lookup) is restored with the inverse h = signs * H_b(z) right after the lookup.
+
+@functools.cache
+def hadamard_matrix(block_size:int, device:str|None=None) -> Tensor:
+  assert block_size & (block_size - 1) == 0, f"hadamard block size must be a power of two, got {block_size}"
+  h = Tensor([[1., 1.], [1., -1.]], device=device)
+  while h.shape[0] < block_size: h = h.cat(h, dim=1).cat(h.cat(-h, dim=1), dim=0)
+  return (h / (block_size ** 0.5)).contiguous().realize()
+
+def hadamard_rotate(x:Tensor, block_size:int, signs:Tensor|None=None, gdn_perm:tuple[int, int, int]|None=None) -> Tensor:
+  n = x.shape[-1]
+  if gdn_perm is not None:  # (hd, nk, rep): heads arrive tiled [rep, nk] (h = rep*nk + k), the fold was computed grouped [nk, rep]
+    hd, nk, rep = gdn_perm
+    x = x.reshape(*x.shape[:-1], rep, nk, hd).transpose(-3, -2).reshape(*x.shape[:-1], n)
+  if signs is not None: x = x * signs
+  h = hadamard_matrix(block_size, x.device)
+  return (x.reshape(*x.shape[:-1], n // block_size, block_size) @ h.cast(x.dtype)).reshape(*x.shape[:-1], n)
+
+def hadamard_unrotate(z:Tensor, block_size:int, signs:Tensor|None=None) -> Tensor:
+  h = hadamard_rotate(z, block_size)
+  return h * signs if signs is not None else h
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
@@ -506,6 +531,7 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
+    self.embed_transform:Callable[[Tensor], Tensor]|None = None  # inverse Hadamard for rotated (Bonsai) embedding tables
     self.mtp_K = 0  # when >0, LLMServer routes generation through generate_mtp(K) (set from the --mtp CLI flag)
     self._mtp_cache: tuple|None = None  # per-K MTP state: (K, commit jits, tok_buf, verify_buf, h_stage)
     # we specialize the JIT for prefill and rollout
@@ -521,8 +547,12 @@ class Transformer:
     self.mtp_draft_jit = TinyJit(self._mtp_draft_step)
     self.verify_jit = TinyJit(self.forward_verify)
 
+  def embed(self, tokens:Tensor) -> Tensor:
+    x = self.token_embd(tokens).float()
+    return self.embed_transform(x) if self.embed_transform is not None else x
+
   def _run_blocks(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
+    x = self.embed(tokens)                                # (B, T, D)
     for block in self.blk: x = block(x, start_pos, verify=verify)
     return x
 
@@ -551,7 +581,7 @@ class Transformer:
 
   def _mtp_draft_step(self, tok:Tensor, h_prev:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
     """one MTP head step: embed `tok`, combine with `h_prev`, run the head block, sample the next draft token."""
-    tok_embed = self.token_embd(tok).float()
+    tok_embed = self.embed(tok)
     h = self.mtp_heads[0](h_prev, tok_embed, start_pos)
     logits = self.output(self.mtp_heads[0].shared_head_norm(h))[:, -1, :]
     samp = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
@@ -654,11 +684,54 @@ class Transformer:
       num_mtp_heads=num_mtp_heads, mtp_ssm_layer=mtp_ssm_layer)
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    if 'prism.hadamard.version' in kv: Transformer._attach_hadamard(model, kv, main_num_blocks)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
     return model, kv
+
+  @staticmethod
+  def _attach_hadamard(model:Transformer, kv:dict, main_num_blocks:int) -> None:
+    # https://github.com/PrismML-Eng/llama.cpp src/llama-model.cpp (prism.hadamard.*) is the reference for this metadata
+    assert kv['prism.hadamard.version'] == 1, f"unsupported prism.hadamard.version {kv['prism.hadamard.version']}"
+    assert kv['prism.hadamard.transform'] == 'normalized-sylvester-walsh-hadamard' and kv['prism.hadamard.axis'] == 'input-last-dimension'
+    sign_mode, block_size = kv['prism.hadamard.sign_mode'], kv['prism.hadamard.block_size']
+    assert sign_mode in ('identity', 'explicit'), f"unsupported prism.hadamard.sign_mode {sign_mode}"
+    device = model.token_embd.weight.device
+    signs:dict[int, Tensor] = {}
+    if sign_mode == 'explicit':
+      widths, values = kv['prism.hadamard.sign_widths'], kv['prism.hadamard.sign_values']
+      assert sum(widths) == len(values), "prism.hadamard.sign_values length mismatch"
+      for w, off in zip(widths, itertools.accumulate([0]+widths[:-1])):
+        signs[w] = Tensor(values[off:off+w], dtype=dtypes.float32, device=device).contiguous().realize()
+    def sign_for(width:int) -> Tensor|None:
+      if sign_mode == 'identity': return None
+      assert width in signs, f"prism.hadamard has no sign vector for width {width}"
+      return signs[width]
+    modules = {k[:-len('.weight')]:v for k, v in nn.state.get_state_dict(model).items() if k.endswith('.weight')}
+    def find_linear(name:str) -> Linear:
+      obj:object = model
+      for part in name.split('.'): obj = obj[int(part)] if isinstance(obj, list) else getattr(obj, part)
+      assert isinstance(obj, Linear), f"prism.hadamard weight {name} is not a Linear"
+      return obj
+    gdn_v_grouped, ssm = kv.get('prism.hadamard.gdn_v_grouped', False), model.blk[0].config.ssm
+    for wname in kv['prism.hadamard.weight_names']:
+      name = wname[:-len('.weight')]
+      if name.startswith('blk.') and int(name.split('.')[1]) >= main_num_blocks: raise NotImplementedError(f"hadamard-folded MTP weight {wname}")
+      assert name in modules, f"prism.hadamard weight not found: {wname}"
+      lin, width = find_linear(name), cast(int, modules[name].shape[-1])
+      assert width % block_size == 0, f"prism.hadamard block size {block_size} does not divide input dimension {width} of {wname}"
+      perm = None
+      if gdn_v_grouped and name.endswith('.ssm_out'):
+        assert ssm is not None
+        n_v, n_k = ssm.time_step_rank, ssm.group_count
+        assert n_v % n_k == 0 and width % n_v == 0, f"prism.hadamard: bad GDN head geometry for {wname}"
+        perm = (width // n_v, n_k, n_v // n_k)
+      lin.pre_transform = functools.partial(hadamard_rotate, block_size=block_size, signs=sign_for(width), gdn_perm=perm)
+    for wname in kv.get('prism.hadamard.inverse_weight_names', []):
+      assert wname == 'token_embd.weight', f"prism.hadamard: {wname} is not a verified inverse-after-lookup table"
+      model.embed_transform = functools.partial(hadamard_unrotate, block_size=block_size, signs=sign_for(model.blk[0].config.dim))
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
