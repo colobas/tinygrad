@@ -1,5 +1,5 @@
 from __future__ import annotations
-import array, enum, functools, itertools, pathlib
+import array, enum, functools, itertools, math, pathlib
 from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
@@ -52,6 +52,11 @@ def hadamard_rotate(x:Tensor, block_size:int, signs:Tensor|None=None, gdn_perm:t
     hd, nk, rep = gdn_perm
     x = x.reshape(*x.shape[:-1], rep, nk, hd).transpose(-3, -2).reshape(*x.shape[:-1], n)
   if signs is not None: x = x * signs
+  if (side := math.isqrt(block_size)) ** 2 == block_size:
+    # Sylvester Hadamard is a Kronecker power, so H_b = H_s (x) H_s with s = sqrt(b): H_b vec(X) = vec(H_s X H_s) -- two s x s
+    # matmuls instead of one b x b (16x fewer flops at b=1024, and H_s is symmetric so no transposes)
+    h = hadamard_matrix(side, x.device).cast(x.dtype)
+    return (h @ x.reshape(*x.shape[:-1], n // block_size, side, side) @ h).reshape(*x.shape[:-1], n)
   h = hadamard_matrix(block_size, x.device)
   return (x.reshape(*x.shape[:-1], n // block_size, block_size) @ h.cast(x.dtype)).reshape(*x.shape[:-1], n)
 
@@ -538,6 +543,9 @@ class Transformer:
     self._cached_tokens: list[int] = []
     self.embed_transform:Callable[[Tensor], Tensor]|None = None  # inverse Hadamard for rotated (Bonsai) embedding tables
     self.mtp_K = 0  # when >0, LLMServer routes generation through generate_mtp(K) (set from the --mtp CLI flag)
+    # prompt tokens per prefill forward. the quant WMMA kernels stream the weights once per chunk, so bigger chunks amortize weight
+    # traffic (32 -> 64 is +30% prefill on bonsai2:27b, 128 is flat). fixed per process: the prefill JIT binds this as the toks range
+    self.prefill_chunk = 64
     self._mtp_cache: tuple|None = None  # per-K MTP state: (K, commit jits, tok_buf, verify_buf, h_stage)
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
@@ -763,7 +771,8 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
+    if chunk_size is None: chunk_size = self.prefill_chunk
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -785,11 +794,12 @@ class Transformer:
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
 
-  def generate_mtp(self, tokens:list[int], K:int, chunk_size:int=32, temperature:float=0.0):
+  def generate_mtp(self, tokens:list[int], K:int, chunk_size:int|None=None, temperature:float=0.0):
     """Speculative decoding via the MTP head(s): chain-draft K tokens, verify all K+1 (last_committed + K drafts) in
     one batched TreeWY forward, commit the longest accepted prefix (+1 bonus token), and reconstruct the SSM state at
     the accept position in O(1) via GatedDeltaNetBlock.commit_verify -- no per-position state snapshots."""
     assert K >= 1 and self.mtp_heads, "generate_mtp requires --mtp K>=1 and a checkpoint with MTP heads"
+    if chunk_size is None: chunk_size = self.prefill_chunk
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)

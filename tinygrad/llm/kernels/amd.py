@@ -361,6 +361,19 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
                             f"linear_q{4 if ggml_type == Q4_K else 5}_k_f16_wmma")
 
 @functools.cache
+def _pq2_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
+  token_tile, output_tiles = (64, 1) if out_features <= 1024 and out.shape[0] % 64 == 0 else \
+    (64, 2) if out.shape[0] % 64 == 0 else (32 if out.shape[0] % 32 == 0 else 16, 2)
+  def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
+    # a 256-wide "block" is two re-packed 9-word PQ2_0 blocks; the subgroup's 32 codes are words 1+2*sub, 2+2*sub of its block
+    blk = base + (subgroup // 4) * PQ2_WORDS
+    d, word = _half(raw[blk] & 0xffff), raw[blk + 1 + (subgroup % 4)*2 + half]
+    # transposed layout from set_quantized: element 4k+b sits at bits 8b+2k
+    return tuple((((word >> (8*b + 2*k)) & 3).float() - 1).cast(dtypes.float16) * d.cast(dtypes.float16) for k in range(4) for b in range(4))
+  return _quant_linear_wmma(out, x, out_features, in_features, 2*PQ2_WORDS, _wmma_layout(out, out_features, token_tile, output_tiles),
+                            dequant, "linear_pq2_0_f16_wmma")
+
+@functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int) -> UOp:
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
     (out_features <= 6144 or out_features == 5120 and in_features > 8192) else 128 if out.shape[0] % 128 == 0 else \
@@ -398,8 +411,9 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
-    fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
+  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS, PQ2_0) and in_features % GGML_BLOCK_SIZE == 0:
+    fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else _pq2_linear_f16_wmma_kernel if layer.ggml_type == PQ2_0 else \
+      functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
