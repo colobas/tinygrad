@@ -59,6 +59,11 @@ def hadamard_unrotate(z:Tensor, block_size:int, signs:Tensor|None=None) -> Tenso
   h = hadamard_rotate(z, block_size)
   return h * signs if signs is not None else h
 
+def _get_module(root, name:str):
+  obj = root
+  for part in name.split('.'): obj = obj[int(part)] if isinstance(obj, list) else getattr(obj, part)
+  return obj
+
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
   vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
@@ -687,11 +692,21 @@ class Transformer:
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     if 'prism.hadamard.version' in kv: Transformer._attach_hadamard(model, kv, main_num_blocks)
+    if amd_custom_kernels_supported(model.token_embd.weight.device):
+      # re-pack the quantized linears for the custom kernels now, one at a time: each source buffer is freed as soon as its re-packed
+      # copy exists, instead of every source coexisting with every copy (and the KV cache) during the first forward
+      for lin in model.linears():
+        lin.set_quantized(lin.weight)
+        if lin.ggml_type is not None: lin.weight.realize()
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
     return model, kv
+
+  def linears(self) -> list[Linear]:
+    ret = [_get_module(self, k[:-len('.weight')]) for k in nn.state.get_state_dict(self) if k.endswith('.weight')]
+    return [m for m in ret if isinstance(m, Linear)]
 
   @staticmethod
   def _attach_hadamard(model:Transformer, kv:dict, main_num_blocks:int) -> None:
@@ -713,8 +728,7 @@ class Transformer:
       return signs[width]
     modules = {k[:-len('.weight')]:v for k, v in nn.state.get_state_dict(model).items() if k.endswith('.weight')}
     def find_linear(name:str) -> Linear:
-      obj:object = model
-      for part in name.split('.'): obj = obj[int(part)] if isinstance(obj, list) else getattr(obj, part)
+      obj = _get_module(model, name)
       assert isinstance(obj, Linear), f"prism.hadamard weight {name} is not a Linear"
       return obj
     gdn_v_grouped, ssm = kv.get('prism.hadamard.gdn_v_grouped', False), model.blk[0].config.ssm

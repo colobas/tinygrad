@@ -22,6 +22,11 @@ _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                16:(256,66), 17:(256,74), 18:(256,98), 19:(256,50), 20:(32,18), 21:(256,110), 22:(256,82), 23:(256,136),
                29:(256,56), 39:(32,17), 41:(128,18), 42:(64,18), 142:(128,34), 143:(128,28)}
 
+def ggml_nbytes(n: int, ggml_type: int) -> int:
+  if (dtype := _GGML_NATIVE.get(ggml_type)) is not None: return dtype.itemsize * n
+  if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None: return (n // nelements_nbytes[0]) * nelements_nbytes[1]
+  raise ValueError(f"GGML type '{ggml_type}' is not supported!")
+
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
@@ -212,8 +217,8 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
 def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
-  # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
+  # the header is read from the source tensor (DISK or device) and every weight is copied to the default device as its own buffer:
+  # the file never has to be resident on the device as a whole (a single file-sized buffer would stay alive as long as any view of it)
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -227,7 +232,9 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  data = {name: tensor[data_start + off:data_start + off + ggml_nbytes(prod(dims), typ)].to(None) for name, dims, typ, off in t_infos}
+  Tensor.realize(*data.values())
+  state_dict = {name: ggml_data_to_tensor(data[name], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
