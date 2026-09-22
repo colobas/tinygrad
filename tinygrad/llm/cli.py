@@ -99,6 +99,8 @@ models = {
   # PrismML Ternary Bonsai 2 (Qwen3.8-27B backbone, ternary g128, Hadamard-rotated basis). PQ2_0: 2-bit slots 7.2GB, PTQ1_0: dense trits 5.9GB
   "bonsai2:27b": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf",
   "bonsai2:27b-ptq1": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+  "bonsai2:27b-uncensored": "https://huggingface.co/dealignai/Bonsai-27b-1bit-CRACK-GGUF/resolve/main/Bonsai-27b-1bit-CRACK-Q1_0.gguf",
+  "bonsai2:27b-ptq1-uncensored": "https://huggingface.co/dealignai/Bonsai-27b-1bit-CRACK-GGUF/resolve/main/Bonsai-27b-1bit-CRACK-Q1_0.gguf",
   "qwen3.6:27b": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
   "qwen3.6:35b-a3b": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
   # pinned to the last revision with the plain IQ4_XS quant: the UD replacement uses Q3_K tensors the loader doesn't support
