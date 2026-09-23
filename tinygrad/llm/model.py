@@ -9,6 +9,8 @@ from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attentio
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
+PREFILL_TAIL = 128  # max tokens per call of the prefill tail JIT (Apple GPUs: 32-token calls ran at ~35 tok/s, 128 at ~95)
+
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
   SIGMOID = 2
@@ -551,6 +553,9 @@ class Transformer:
     self._mtp_cache: tuple|None = None  # per-K MTP state: (K, commit jits, tok_buf, verify_buf, h_stage)
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
+    # the matmuls of a prefill chunk run at the chunk's static max size, so the last partial chunk of a prompt goes through a small
+    # tail JIT instead of paying for a whole padded chunk
+    self.prefill_tail_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
     # MTP speculative-decode hot path: each K-loop draft step and the verify forward get their own TinyJit, mirroring
     # rollout_jit above -- start_pos is bound to a UOp Variable at the call site (generate_mtp), never passed as a
@@ -708,8 +713,11 @@ class Transformer:
       for lin in model.linears():
         lin.set_quantized(lin.weight)
         if lin.ggml_type is not None: lin.weight.realize()
-      if amd_custom_kernels_supported(model.token_embd.weight.device) and any(lin.ggml_type in TERNARY_TYPES for lin in model.linears()):
-        model.prefill_chunk = 128  # the RDNA3 int8 WMMA prefill is not weight-bound
+      if any(lin.ggml_type in TERNARY_TYPES for lin in model.linears()):
+        # the RDNA3 int8 WMMA prefill is not weight-bound at 128; on Apple GPUs full 512-token chunks run at 97 tok/s vs ~85 at 128
+        # (the prompt tail goes through the 128-token tail JIT)
+        model.prefill_chunk = 512 if gated_delta_kernel_supported(model.token_embd.weight.device) and \
+          not amd_custom_kernels_supported(model.token_embd.weight.device) else 128
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -763,6 +771,11 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    if self.prefill_chunk > PREFILL_TAIL:  # capture the full-chunk prefill JIT too (generate([0]) only reaches the tail JIT)
+      for _ in range(2):
+        self._cached_tokens = []
+        list(zip(range(1), self.generate([0]*self.prefill_chunk)))
+      self._cached_tokens = []
     if self.mtp_K > 0:  # capture the MTP jits (verify/draft/commits) too: they'd otherwise stall the first request
       for _ in range(3): list(zip(range(2 * (self.mtp_K + 1)), self.generate_mtp([0], self.mtp_K)))
       self._cached_tokens = []
@@ -779,7 +792,7 @@ class Transformer:
     if chunk_size is None: chunk_size = self.prefill_chunk
     if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
+    v_toks, v_tail = UOp.variable("toks", 1, chunk_size), UOp.variable("tail_toks", 1, min(chunk_size, PREFILL_TAIL))
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
@@ -788,9 +801,12 @@ class Transformer:
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      remaining = len(tokens) - start_pos
+      tail = start_pos < prompt_len and remaining < chunk_size and chunk_size > PREFILL_TAIL
+      n_toks = min(PREFILL_TAIL if tail else chunk_size, remaining)
+      sp, nt = v_start_pos.bind(start_pos), (v_tail if tail else v_toks).bind(n_toks)
+      if tail: out = self.prefill_tail_jit(t[:, sp:sp+nt].contiguous(), sp, temp).realize()
+      else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
