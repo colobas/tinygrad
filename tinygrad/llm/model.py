@@ -4,7 +4,7 @@ from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, PQ2_0
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, TERNARY_TYPES
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -707,7 +707,7 @@ class Transformer:
       for lin in model.linears():
         lin.set_quantized(lin.weight)
         if lin.ggml_type is not None: lin.weight.realize()
-      if any(lin.ggml_type == PQ2_0 for lin in model.linears()): model.prefill_chunk = 128  # int8 WMMA prefill is not weight-bound
+      if any(lin.ggml_type in TERNARY_TYPES for lin in model.linears()): model.prefill_chunk = 128  # int8 WMMA prefill is not weight-bound
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

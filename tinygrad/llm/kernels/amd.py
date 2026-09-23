@@ -18,9 +18,14 @@ Q6_PADDED, Q6_WORDS = 212, 53  # the 210-byte Q6 blocks are padded to 212 bytes 
 # 2-byte aligned, so set_quantized re-packs each into 9 words: [scale][8 code words], with the 16 codes of every word transposed so
 # that (word >> 2k) & 0x03030303 yields the 4 consecutive weights 4k..4k+3 as int8 lanes (one shift+and per dp4a operand)
 PQ2_0, PQ2_BYTES, PQ2_BLOCK, PQ2_WORDS = 142, 34, 128, 9
-PQ2_I8_WMMA = bool(getenv("PQ2_I8_WMMA", 1))  # int8 tensor-core prefill for PQ2_0 (0: f16 WMMA path)
-QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4, PQ2_0: PQ2_BYTES*2}  # bytes per 256-weight block
-BLOCK_BYTES = {**QUANT_SIZES, PQ2_0: PQ2_BYTES}  # ggml_data_to_tensor's per-block reshape width
+PQ2_I8_WMMA = bool(getenv("PQ2_I8_WMMA", 1))  # int8 tensor-core prefill for PQ2_0 and Q1_0 (0: f16 WMMA path / decode kernel)
+# Q1_0 (1-bit, 128 weights per 18-byte block: f16 scale + 16 bytes of sign bits, value = d*(2*bit-1)). re-packed into 5 words:
+# [scale][4 bit words], each word's 32 bits transposed so that (word >> k) & 0x01010101 yields weights 4k..4k+3 as int8 lanes
+Q1_0, Q1_BYTES, Q1_WORDS = 41, 18, 5
+TERNARY_TYPES = (PQ2_0, Q1_0)  # 128-wide blocks with a re-packed [scale][code words] layout and the int8 WMMA prefill
+QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4, PQ2_0: PQ2_BYTES*2,
+               Q1_0: Q1_BYTES*2}  # bytes per 256-weight block
+BLOCK_BYTES = {**QUANT_SIZES, PQ2_0: PQ2_BYTES, Q1_0: Q1_BYTES}  # ggml_data_to_tensor's per-block reshape width
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -94,6 +99,14 @@ class Linear(nn.Linear):
       # 4x4 transpose of the 2-bit fields: code 4k+b moves from bit 8k+2b to bit 8b+2k
       transposed = functools.reduce(Tensor.bitwise_or, [((codes >> (8*k+2*b)) & 3) << (8*b+2*k) for k in range(4) for b in range(4)])
       self.weight = scale.cat(transposed, dim=1).contiguous().reshape(nblocks * PQ2_WORDS)
+    elif self.ggml_type == Q1_0:
+      nbytes, nblocks = raw.max_numel(), raw.max_numel() // Q1_BYTES
+      block_bytes = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(nbytes, dtypes.uint8, raw_offset))).reshape((nblocks, Q1_BYTES))
+      scale = block_bytes[:, :2].pad_to((nblocks, 4)).bitcast(dtypes.uint32)
+      bits = block_bytes[:, 2:].bitcast(dtypes.uint32)  # (nblocks, 4): weight j of a word is bit j
+      # transpose: weight 4k+b moves from bit 4k+b to bit 8b+k
+      transposed = functools.reduce(Tensor.bitwise_or, [((bits >> (4*k+b)) & 1) << (8*b+k) for k in range(8) for b in range(4)])
+      self.weight = scale.cat(transposed, dim=1).contiguous().reshape(nblocks * Q1_WORDS)
     else:
       self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
@@ -112,7 +125,7 @@ class Linear(nn.Linear):
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
             return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, PQ2_0) and supported:
+    if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, *TERNARY_TYPES) and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
@@ -255,6 +268,15 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
       gsum = xs[token, group, 0].load() + xs[token, group, 1].load()
       return (dot.float()*d*scale - gsum*dmin*minimum) * xd[token, group]
+    if ggml_type == Q1_0:
+      # 4 q8 groups per 128-weight block, one bit word each. weights are 2*bit-1: dot the bits, fold the -1 through the group sum
+      q_block, q_sub = group // 4, group % 4
+      base = (output * in_features//PQ2_BLOCK + q_block) * Q1_WORDS
+      bits = _amd_load(raw[base + 1 + q_sub])
+      dot = UOp.const(0, dtypes.int32)
+      for word_idx in range(8): dot = _amd_dp4a((bits >> word_idx) & 0x01010101, xwords[word_idx], dot)
+      gsum = xs[token, group, 0].load() + xs[token, group, 1].load()
+      return (dot.float()*2 - gsum) * _half(raw[base] & 0xffff) * xd[token, group]
     if ggml_type == PQ2_0:
       # 4 q8 groups per 128-weight block: the subgroup's 32 codes are 2 consecutive words
       pq_block, pq_sub = group // 4, group % 4
@@ -293,7 +315,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
               .cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
     gsum = [xs[token, group, i].load() * 32 for i in range(2)]
     return ((dots[0].float() - gsum[0])*scales[0] + (dots[1].float() - gsum[1])*scales[1]) * xd[token, group] * _half(raw[base+52] & 0xffff)
-  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6", PQ2_0: "linear_pq2_0"}
+  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6", PQ2_0: "linear_pq2_0", Q1_0: "linear_q1_0"}
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
@@ -388,7 +410,7 @@ def _pq2_i8_tiling(tokens:int, out_features:int, in_features:int) -> tuple[int, 
   return tt, ot, ks
 
 @functools.cache
-def _pq2_linear_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xs:UOp, out_features:int, in_features:int) -> UOp:
+def _pq2_linear_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int=PQ2_0) -> UOp:
   # int8 tensor-core prefill: the activations are int8 with one scale per token per 128-block (same blocking as the weights), so a
   # whole 128-block (8 K-steps) accumulates in int32 and is rescaled once. the 2-bit codes need only shift+and+byte_perm to become
   # int8 lanes ({-1,0,1,2}), vs ~5 VALU ops per weight for the f16 dequant. B fragments are shared by all token tiles
@@ -402,7 +424,8 @@ def _pq2_linear_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xs:UOp, out_features:in
   accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in output_accs) for output_accs in accs)
   block_r = UOp.range(n_blocks, 4, AxisType.REDUCE)
   block, all_blocks = ks*n_blocks + block_r, in_features // PQ2_BLOCK
-  code_table = UOp.const(0x020100ff, dtypes.uint32)  # byte_perm LUT: code 0,1,2,3 -> int8 -1,0,1,2
+  # byte_perm LUT: PQ2_0 code 0,1,2,3 -> int8 -1,0,1,2; Q1_0 bit 0,1 -> int8 -1,+1
+  code_table, words = UOp.const(0x020100ff if ggml_type == PQ2_0 else 0x000001ff, dtypes.uint32), PQ2_WORDS if ggml_type == PQ2_0 else Q1_WORDS
   int_accs = [[UOp.stack(*(UOp.const(0, dtypes.int32),)*8)]*tt for _ in range(output_tiles)]
   def int8x16(words:tuple[UOp, ...]) -> UOp:  # 4 u32 -> 16 int8 lanes (byte extraction; clang folds it back into the registers)
     return UOp.stack(*(((w >> (8*b)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8) for w in words for b in range(4)))
@@ -411,13 +434,18 @@ def _pq2_linear_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xs:UOp, out_features:in
     aw = tuple(_amd_load(xq[input_token, (block*PQ2_BLOCK + kstep*16)//4], 4) for input_token in input_tokens)
     afrags = tuple(int8x16(tuple(w[i] for i in range(4))) for w in aw)
     for ot, output in enumerate(outputs):
-      word = raw[(output*all_blocks + block)*PQ2_WORDS + 1 + kstep]
-      bfrag = int8x16(tuple(_amd_byte_perm(UOp.const(0, dtypes.uint32), code_table, (word >> (2*k)) & 0x03030303) for k in range(4)))
+      if ggml_type == PQ2_0:
+        word = raw[(output*all_blocks + block)*words + 1 + kstep]
+        sel = tuple((word >> (2*k)) & 0x03030303 for k in range(4))
+      else:  # a Q1_0 bit word covers 2 K-steps: operands 4*(kstep%2)..+3
+        word = raw[(output*all_blocks + block)*words + 1 + kstep//2]
+        sel = tuple((word >> (4*(kstep%2) + k)) & 0x01010101 for k in range(4))
+      bfrag = int8x16(tuple(_amd_byte_perm(UOp.const(0, dtypes.uint32), code_table, v) for v in sel))
       for tile, afrag in enumerate(afrags):
         int_accs[ot][tile] = UOp.wmma(afrag, bfrag, int_accs[ot][tile], *WMMA_ARG)
   updates = []
   for ot, output in enumerate(outputs):
-    d = _half(raw[(output*all_blocks + block)*PQ2_WORDS] & 0xffff)
+    d = _half(raw[(output*all_blocks + block)*words] & 0xffff)
     for tile in range(tt):
       prev = accs[ot][tile].after(block_r)
       # physical C-fragment layout: element i of a lane in wave-half h is row 2i+h (the LDS exchange in _wmma_stores un-interleaves it)
@@ -426,7 +454,8 @@ def _pq2_linear_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xs:UOp, out_features:in
       updates.append(accs[ot][tile].store(UOp.stack(*vals)))
   update = UOp.group(*updates).end(block_r)
   stores = _wmma_stores(out, outputs, tokens, accs, update, physical_half, lane, wave, output_waves, ksplit=ks)
-  return UOp.group(*stores).end(token_block, output_block, ks, lane, wave).sink(arg=KernelInfo(name="linear_pq2_0_i8_wmma", opts_to_apply=()))
+  name = "linear_pq2_0_i8_wmma" if ggml_type == PQ2_0 else "linear_q1_0_i8_wmma"
+  return UOp.group(*stores).end(token_block, output_block, ks, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def q8_block_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
   # int8 activations with one scale per token per 128-block, for the int8 WMMA prefill (memoized like q8_quantize)
@@ -468,7 +497,7 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma")
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
-  assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, PQ2_0)
+  assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS, *TERNARY_TYPES)
   tokens = int(x.numel()) // layer.in_features
   raw, out_features, in_features = layer.weight.uop, layer.out_features, layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
@@ -480,10 +509,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type == PQ2_0 and in_features % PQ2_BLOCK == 0 and PQ2_I8_WMMA:
+  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in TERNARY_TYPES and in_features % PQ2_BLOCK == 0 and PQ2_I8_WMMA:
     xq8, xs8 = q8_block_quantize(x, tokens, in_features)
     out = Tensor.empty(tokens, out_features, _pq2_i8_tiling(tokens, out_features, in_features)[2], dtype=dtypes.float32, device=x.device).uop
-    return run(_pq2_linear_i8_wmma_kernel, out, raw, xq8.bitcast(dtypes.uint32).uop, xs8.uop)
+    return run(functools.partial(_pq2_linear_i8_wmma_kernel, ggml_type=layer.ggml_type), out, raw, xq8.bitcast(dtypes.uint32).uop, xs8.uop)
   if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS, PQ2_0) and in_features % GGML_BLOCK_SIZE == 0:
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else _pq2_linear_f16_wmma_kernel if layer.ggml_type == PQ2_0 else \
       functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
