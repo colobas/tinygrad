@@ -57,6 +57,61 @@ def _q1_decode_kernel(out:UOp, w:UOp, planes:UOp, xsc:UOp, qsum:UOp, out_feature
   st = [out[t, o, ks].store(acc.after(loop)[t].load()) for t in range(tokens)]
   return UOp.group(*st).end(ob, ks, lane).sink(arg=KernelInfo(name="linear_q1_0_metal", opts_to_apply=()))
 
+# ******** Q1_0 prefill: port of mlx's qmm_t (mlx/backend/metal/kernels/quantized.h + steel/gemm/mma.h) ********
+# 32x32x32 tiles, 4 simdgroups in a 2x2 grid, each owning 16x16 of the output as 2x2 8x8 simdgroup_matrix accumulators. every K step
+# the workgroup stages the activation tile and the dequantized weight tile in threadgroup memory. with the block-major re-pack, a
+# 32-wide K tile of an output row is exactly one bit word.
+
+Q1_BM = Q1_BN = Q1_BK = 32
+Q1_PAD = 8  # halves of padding per threadgroup row (mlx: BK_padded = BK + 16 / sizeof(T))
+
+def _frag_coord(lane:UOp) -> tuple[UOp, UOp]:
+  # mlx steel BaseMMAFrag::get_coord: lane holds (row fm, cols fn and fn+1) of every 8x8 fragment
+  qid = lane // 4
+  return (qid & 4) + (lane // 2) % 4, (qid & 2) * 2 + (lane % 2) * 2
+
+@functools.cache
+def _q1_prefill_kernel(out:UOp, w:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
+  tokens, nb = cast(int, out.shape[0]), in_features // Q1_BLOCK
+  words, scales = w.flatten()[:nb*out_features*4].reshape(nb, out_features, 4), w.flatten()[nb*out_features*4:]
+  tile_n, tile_m = UOp.range(out_features//Q1_BN, 0, AxisType.GLOBAL), UOp.range(tokens//Q1_BM, 1, AxisType.GLOBAL)
+  sg, lane = UOp.range(4, 2, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  tid, fm, fn = sg*32 + lane, *_frag_coord(lane)
+  tm, tn = (sg // 2) * 8, (sg % 2) * 8
+  accs = [UOp.placeholder((2,), dtypes.float32, slot=i, addrspace=AddrSpace.REG) for i in range(4)]
+  accs = [a.after(a.store(a.const_like(0))) for a in accs]
+  xs_lds = UOp.placeholder((Q1_BM, Q1_BK + Q1_PAD), dtypes.half, slot=10, addrspace=AddrSpace.LOCAL)
+  ws_lds = UOp.placeholder((Q1_BN, Q1_BK + Q1_PAD), dtypes.half, slot=11, addrspace=AddrSpace.LOCAL)
+  kt = UOp.range(in_features//Q1_BK, 3, AxisType.REDUCE)
+  # stage: thread t copies 8 activations of row t//4 and dequantizes 8 weights (bits 8*(t%4)..+7 of one word) of output row t//4
+  row, part = tid // 4, tid % 4
+  stores = [xs_lds.after(kt)[row, part*8 + j].store(x[tile_m*Q1_BM + row, kt*Q1_BK + part*8 + j].load()) for j in range(8)]
+  n = tile_n*Q1_BN + row
+  word = words[kt // 4, n, kt % 4].load()
+  sidx = (kt // 4)*out_features + n
+  d = ((scales[sidx//2].load() >> ((sidx % 2)*16).cast(dtypes.uint32)) & 0xffff).cast(dtypes.uint16).bitcast(dtypes.half)
+  stores += [ws_lds.after(kt)[row, part*8 + j].store(((word >> (part*8 + j)) & 1).ne(0).where(d, -d)) for j in range(8)]
+  xs_t, ws_t = xs_lds.after(UOp.barrier(UOp.group(*stores))), ws_lds.after(UOp.barrier(UOp.group(*stores)))
+  vals = [accs[i*2+j].after(kt) for i in range(2) for j in range(2)]
+  cur = [UOp.stack(v[0].load(), v[1].load()) for v in vals]
+  for kk in range(Q1_BK // 8):
+    afr = [UOp.stack(*(xs_t[tm + 16*i + fm, kk*8 + fn + e].load() for e in range(2))) for i in range(2)]
+    # B[k][n] = W[n][k]: the lane's B elements are (k = kk*8+fm, n = fn and fn+1)
+    bfr = [UOp.stack(*(ws_t[tn + 16*j + fn + e, kk*8 + fm].load() for e in range(2))) for j in range(2)]
+    cur = [UOp.wmma(afr[i], bfr[j], cur[i*2+j], (8, 8, 8), "METAL", 32) for i in range(2) for j in range(2)]
+  upd = UOp.group(*(accs[i].store(cur[i]) for i in range(4))).barrier().end(kt)
+  st = [out[tile_m*Q1_BM + tm + 16*i + fm, tile_n*Q1_BN + tn + 16*j + fn + e].store(accs[i*2+j].after(upd)[e].load())
+        for i in range(2) for j in range(2) for e in range(2)]
+  return UOp.group(*st).end(tile_n, tile_m, sg, lane).sink(arg=KernelInfo(name="linear_q1_0_qmm", opts_to_apply=()))
+
+def q1_prefill(packed:Tensor, x:Tensor, out_features:int, in_features:int) -> Tensor:
+  tokens = cast(int, x.numel()) // in_features
+  assert tokens % Q1_BM == 0 and out_features % Q1_BN == 0 and in_features % Q1_BLOCK == 0
+  out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_q1_prefill_kernel, out_features=out_features, in_features=in_features)
+  return Tensor.custom_kernel(out, packed, x.reshape(tokens, in_features).cast(dtypes.half).contiguous(), fxn=fxn)[0] \
+    .reshape(*x.shape[:-1], out_features)
+
 def q1_activation_planes(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
   if (memo := _planes_memo.get(x.uop)) is not None: return memo
   nb = in_features // Q1_BLOCK

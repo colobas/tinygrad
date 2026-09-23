@@ -166,8 +166,14 @@ class Linear(nn.Linear):
     else:
       # prefill: matmul against the dequantized weight at a static (padded) token count, fused by the scheduler
       w = q1_dequant(self.weight, self.out_features, self.in_features)
-      if isinstance(numel, int): out = x.linear(w.T)
-      else: out = x.pad_to(x.max_shape).linear(w.T).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+      xp = (x if isinstance(numel, int) else x.pad_to(x.max_shape)).cast(dtypes.half).contiguous()
+      # Q1_QMM=1: port of mlx's qmm_t (kernels/metal.py). same speed as mlx's 2-bit qmm in isolation, ~5% behind the BEAM-tuned fused
+      # dequant matmul inside the model, so it is opt-in
+      if cast(int, xp.numel()) // self.in_features % 32 == 0 and self.out_features % 32 == 0 and getenv("Q1_QMM", 0):
+        from tinygrad.llm.kernels.metal import q1_prefill
+        out = q1_prefill(self.weight, xp, self.out_features, self.in_features)
+      else: out = xp.matmul(w.T, dtype=dtypes.float)
+      if not isinstance(numel, int): out = out.contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
