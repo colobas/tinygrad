@@ -44,7 +44,19 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   with Context(ALLOW_DEVICE_USAGE=1):
     return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def is_metal(device:str|tuple[str, ...]|None) -> bool:
+  if isinstance(device, tuple): device = device[0]
+  return device is not None and device.split(":")[0] == "METAL"
+
+def gated_delta_kernel_supported(device:str|tuple[str, ...]|None) -> bool:
+  # the fused recurrent scan only needs a 32-lane reduction: ds_swizzle on RDNA3, simd_sum on Apple GPUs
+  return amd_custom_kernels_supported(device) or is_metal(device)
+
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, metal:bool=False) -> UOp:
+  if metal:  # Apple GPUs: one 32-wide simdgroup, a single simd_sum/simd_max (mlx_lm's gated_delta kernel does the same)
+    assert full_wave, "metal warp_reduce reduces the full 32-lane simdgroup"
+    if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
+    return UOp(Ops.CUSTOM, src=(val,), arg=(f"{'simd_max' if maximum else 'simd_sum'}({{0}})", dtypes.float))
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
     other = UOp(Ops.CUSTOM, src=(val,), arg=
@@ -81,6 +93,12 @@ class Linear(nn.Linear):
     if not any(u.op is Ops.RESHAPE and u.shape[-1:] == (BLOCK_BYTES[ggml_type],) for u in graph): return
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
+    if is_metal(self.weight.device):
+      if ggml_type != Q1_0: return  # only Q1_0 has an Apple GPU kernel; everything else stays on the generic fused dequant
+      from tinygrad.llm.kernels.metal import q1_repack
+      block_bytes = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(raw.max_numel(), dtypes.uint8, raw_offset)))
+      self.ggml_type, self.weight = Q1_0, q1_repack(block_bytes, self.out_features, self.in_features)
+      return
     self.ggml_type = ggml_type
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
     # scheduling and would copy the entire packed weight on every JIT graph
@@ -112,6 +130,10 @@ class Linear(nn.Linear):
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
   def __call__(self, x:Tensor) -> Tensor:
     if self.pre_transform is not None: x = self.pre_transform(x)
+    if self.use_custom_quant and is_metal(self.weight.device):
+      if self.ggml_type is None: self.set_quantized(self.weight)
+      if self.ggml_type == Q1_0: return self._metal_q1(x)
+      self.use_custom_quant = False
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
@@ -130,7 +152,23 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if not isinstance(x.numel(), int):
+      # symbolic token count (prefill chunk): pad to the static max so the matmul (incl. a fused ggml dequant) gets a static shape
+      # the optimizer can tile for tensor cores (the contiguous keeps the scheduler from pushing the shrink back into the matmul).
+      # with a symbolic dim the fused Q1_0 matmul on METAL ran ~8x slower
+      return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
+
+  def _metal_q1(self, x:Tensor) -> Tensor:
+    from tinygrad.llm.kernels.metal import q1_linear, q1_dequant
+    numel = x.numel()
+    if isinstance(numel, int) and numel // self.in_features < 16: out = q1_linear(self.weight, x, self.out_features, self.in_features)
+    else:
+      # prefill: matmul against the dequantized weight at a static (padded) token count, fused by the scheduler
+      w = q1_dequant(self.weight, self.out_features, self.in_features)
+      if isinstance(numel, int): out = x.linear(w.T)
+      else: out = x.pad_to(x.max_shape).linear(w.T).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   # int8 4-wide dot via the sudot4 builtin. upstream uses portable scalar multiply-adds ("2% decode slower") --
@@ -468,8 +506,10 @@ def q8_block_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Te
 _q8_block_memo:dict[UOp, tuple[Tensor, Tensor]] = {}
 
 def clear_activation_memos() -> None:
+  from tinygrad.llm.kernels.metal import _planes_memo
   _q8_memo.clear()
   _q8_block_memo.clear()
+  _planes_memo.clear()
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int) -> UOp:
@@ -780,7 +820,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
+                                metal:bool=False) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -803,8 +844,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   for row_idx,row in enumerate(rows):
     previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
     av, bv = alpha[bh, token, row if alpha_dim > 1 else 0].load(), beta[bh, token].load()
-    state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True)
-    state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
+    state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True, metal=metal)
+    state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True, metal=metal)
     delta = (v[bh, token, row].load() - state_k*av) * bv
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
@@ -821,10 +862,11 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
-  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=_gated_delta_prefill_kernel)[0]
+  metal = is_metal(q.device)
+  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, metal=metal))[0]
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   assert start_pos.uop.is_bound_var
   # the bound start_pos reaches the graph through the state AFTER chain, like the flash kernels' valid_end
-  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0])).call(*contig)
+  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0]), metal=metal).call(*contig)
   return Tensor(contig[0].after(call))

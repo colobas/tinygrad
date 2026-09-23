@@ -4,7 +4,8 @@ from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, TERNARY_TYPES
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, \
+  TERNARY_TYPES, gated_delta_kernel_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -394,8 +395,8 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
-      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and gated_delta_kernel_supported(x.device):
+      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3, Apple GPUs)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
@@ -701,13 +702,14 @@ class Transformer:
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     if 'prism.hadamard.version' in kv: Transformer._attach_hadamard(model, kv, main_num_blocks)
-    if amd_custom_kernels_supported(model.token_embd.weight.device):
+    if amd_custom_kernels_supported(model.token_embd.weight.device) or gated_delta_kernel_supported(model.token_embd.weight.device):
       # re-pack the quantized linears for the custom kernels now, one at a time: each source buffer is freed as soon as its re-packed
       # copy exists, instead of every source coexisting with every copy (and the KV cache) during the first forward
       for lin in model.linears():
         lin.set_quantized(lin.weight)
         if lin.ggml_type is not None: lin.weight.realize()
-      if any(lin.ggml_type in TERNARY_TYPES for lin in model.linears()): model.prefill_chunk = 128  # int8 WMMA prefill is not weight-bound
+      if amd_custom_kernels_supported(model.token_embd.weight.device) and any(lin.ggml_type in TERNARY_TYPES for lin in model.linears()):
+        model.prefill_chunk = 128  # the RDNA3 int8 WMMA prefill is not weight-bound
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -775,7 +777,7 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
     if chunk_size is None: chunk_size = self.prefill_chunk
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -802,7 +804,7 @@ class Transformer:
     the accept position in O(1) via GatedDeltaNetBlock.commit_verify -- no per-position state snapshots."""
     assert K >= 1 and self.mtp_heads, "generate_mtp requires --mtp K>=1 and a checkpoint with MTP heads"
     if chunk_size is None: chunk_size = self.prefill_chunk
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     temp = Tensor([temperature])
