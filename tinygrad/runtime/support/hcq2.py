@@ -150,8 +150,12 @@ def stage_copy(call:UOp, dst:UOp, src:UOp) -> UOp|None:
 
   if (device:=get_enqueue_devs(call)) is None: return None
   dev, host, usb_memcpys = Device[device], Device[device].host, getattr(Device[device], "is_usb", False)
-  mappable = {"CPU", "PYTHON"} | ({"NPY", "DISK"} if usb_memcpys else set())
-  if device != host and not all(Device[d].peer_group == dev.peer_group or (d.split(":")[0] in mappable and Device[d].host == host) for d in devs):
+  # tinygpu (macOS eGPU) can only map its own DMA arenas: host buffers from anywhere else go through the staging buffer
+  stage_all = getattr(dev, "stage_host_copies", False)
+  mappable = set() if stage_all else {"CPU", "PYTHON"} | ({"NPY", "DISK"} if usb_memcpys else set())
+  def is_staging(b:UOp) -> bool: return stage_all and unwrap_view(b)[0] is UOp.from_buffer(_staging(host), dtypes.uint8)
+  if device != host and not all(Device[d].peer_group == dev.peer_group or (d.split(":")[0] in mappable and Device[d].host == host) or is_staging(b)
+                                for d, b in zip(devs, (dst, src))):
     (staging:=_staging(host)).get_buf(device)
     base, it, copies = UOp.from_buffer(staging, dtypes.uint8), src.dtype.itemsize, []
     chunk = (STAGING_SIZE // STAGING_SLOTS) // it

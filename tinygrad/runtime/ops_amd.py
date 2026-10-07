@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any
-import os, ctypes, struct, functools, importlib, mmap, errno, contextlib, sys, itertools, collections, atexit
+import os, types, ctypes, struct, functools, importlib, mmap, errno, contextlib, sys, itertools, collections, atexit
 assert sys.platform != 'win32'
 from dataclasses import dataclass, replace
 from tinygrad.runtime.support.hcq2 import HWQueue, encode_cmdbuf, to_name, patch, unwrap_view, layout_args
@@ -21,7 +21,8 @@ from tinygrad.runtime.support.system import filter_visible_devices
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager
 from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, import_pmc
 from tinygrad.runtime.support.system import PCIIfaceBase, USBPCIDevice, MAP_FIXED, MAP_NORESERVE
-from tinygrad.runtime.support.usb import USB3, setup_usb_rules, usb_reset
+from tinygrad.runtime.support.usb import USB3, setup_usb_rules, usb_reset, usb_stack, usb_deps
+from tinygrad.runtime.support.hcq2 import ccall
 from tinygrad.runtime.support.memory import AddrSpace
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 
@@ -756,7 +757,9 @@ class PCIIface(PCIIfaceBase):
         gart._buf+wptr, eop_buffer._buf, eop_buffer.nbytes, is_aql:=(queue_type==kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL), is_aql)))
 
     put_value = Buffer(host:=self.dev.host, 8, initial_value=bytes(8))
-    doorbell = Buffer(host, 8, options=BufferSpec(external_ptr=self.dev_impl.doorbell64.addr + doorbell_index*8), preallocate=True)
+    # tinygpu: no cpu mapping of the doorbell BAR. the pointer only carries the BAR offset for the MMIO_WRITE lowering (tinygpu_doorbell)
+    db_addr = (TINYGPU_DB_BASE + self.dev_impl.doorbell64.off if getattr(self.pci_dev, "tinygpu", False) else self.dev_impl.doorbell64.addr)
+    doorbell = Buffer(host, 8, options=BufferSpec(external_ptr=db_addr + doorbell_index*8), preallocate=True)
     return AMDQueueDesc(ring=ring, doorbell=doorbell, read_ptr=gart.view(8, rptr).ensure_allocated(),
       write_ptr=gart.view(8, wptr).ensure_allocated(), put_value=put_value, eop_buffer=eop_buffer, params=rcvr_params)
 
@@ -815,6 +818,22 @@ class USBIface(PCIIface):
 
   def sleep(self, timeout): pass
 
+# *** tinygpu (macOS eGPU): host programs ring the doorbell with an MMIO_WRITE packet on the TinyGPU socket, the BARs live in its server
+
+TINYGPU_DB_BASE = 1 << 56
+_libc_write = types.SimpleNamespace(__name__="write", restype=None) # ssize_t has no dtype, the result is unused
+
+def tinygpu_doorbell(dev, b:UOp, idx:UOp, v:UOp) -> UOp|None:
+  base = unwrap_view(b)[0]
+  name = base.arg.name if base.op is Ops.PARAM else base.tag if base.op is Ops.ALLOC else None
+  if not isinstance(name, str) or "doorbell" not in name: return None
+  # the doorbell pointer is TINYGPU_DB_BASE + the BAR offset: the packet's offset comes from it at run time, so any queue's doorbell works
+  pci, bar = dev.iface.pci_dev, dev.iface.dev_impl.doorbell64.residx
+  off, val = b.getaddr("CPU") - TINYGPU_DB_BASE + (idx * 8).cast(dtypes.uint64), v.cast(dtypes.uint64)
+  def le(x:UOp|int, n:int) -> list: return [(x >> (8 * i)) & 0xff if isinstance(x, UOp) else (x >> (8 * i)) & 0xff for i in range(n)]
+  pkt = usb_stack(dtypes.uint8, 7, *le(pci.dev_id, 4), *le(bar, 4), *le(off, 8), *le(8, 8), *le(0, 8), *le(val, 8)) # MMIO_WRITE, 8 bytes
+  return ccall(_libc_write, pci.sock.fileno(), pkt.after(*usb_deps(b)).index(0), 41).sink()
+
 def _mock(iface, name=None): return type(name or f"MOCK{iface.__name__}", (iface,), {})
 
 class AMDDevice(Compiled):
@@ -871,6 +890,9 @@ class AMDDevice(Compiled):
     Compiled.pm_bufferize += PatternMatcher([(UPat(Ops.ALLOC, tag=self.tag("scratch"), name="b"), lambda b, d=self: d.scratch_buffer(b.max_numel())),
                                              (UPat(Ops.ALLOC, name="b"), lambda b, d=self: d.queue_buffer(b.tag))])
     if self.is_usb: setup_usb_rules(self)
+    if (stage_host_copies:=getattr(getattr(self.iface, "pci_dev", None), "tinygpu", False)): self.pm_lower = self.pm_lower + PatternMatcher([
+      (UPat.var("b").index(UPat.var("idx")).store(UPat.var("v")), lambda b, idx, v, d=self: tinygpu_doorbell(d, b, idx, v))])
+    self.stage_host_copies = stage_host_copies
 
     # SQTT is disabled by default because of runtime overhead and big file sizes (~200mb to Tensor.full() two 4096x4096 tensors and matmul them)
     self.pmc_enabled, self.sqtt_enabled, self.prof_enabled = PROFILE > 0 and PMC > 0, PROFILE > 0 and SQTT > 0, PROFILE > 0 and (PMC > 0 or SQTT > 0)

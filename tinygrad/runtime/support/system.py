@@ -1,11 +1,12 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools
+from typing import Any
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools, subprocess, time
 try: import fcntl # windows misses that
 except ImportError: fcntl = None #type:ignore[assignment]
 from tinygrad.device import BufferStorage, Buffer, Device
-from tinygrad.helpers import round_up, getenv, OSX, temp, DEBUG, pluralize, DEV
+from tinygrad.helpers import round_up, getenv, OSX, temp, DEBUG, pluralize, DEV, fetch, system, _ensure_downloads_dir
 from tinygrad.runtime.autogen import libc, pci, vfio
-from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator, MMIOInterface
+from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator, MMIOInterface, TLSFAllocator
 from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface
 
 def filter_visible_devices(devs, device):
@@ -84,7 +85,9 @@ class _System:
   @functools.cache
   def reserve_va(self, va_start, va_size):
     # cached, runs only once per range. used to not collide with other mappings.
-    FileIOInterface.anon_mmap(va_start, va_size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, 0)
+    # macOS has no MAP_FIXED_NOREPLACE: the window is reserved with a plain MAP_FIXED PROT_NONE mapping
+    flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | (MAP_FIXED if OSX else MAP_NORESERVE | MAP_FIXED_NOREPLACE)
+    FileIOInterface.anon_mmap(va_start, va_size, 0, flags, 0)
 
   def memory_barrier(self): lib.atomic_thread_fence(__ATOMIC_SEQ_CST:=5) if (lib:=self.libsys if OSX else self.atomic_lib) is not None else None
 
@@ -92,6 +95,7 @@ class _System:
     if libc.mlock(ctypes.c_void_p(addr), size): raise RuntimeError(f"Failed to lock memory at {addr:#x} with size {size:#x}")
 
   def system_paddrs(self, vaddr:int, size:int) -> list[int]:
+    if OSX: return self.dma_paddrs(vaddr, size)
     self.pagemap.seek(vaddr // mmap.PAGESIZE * 8)
     return [(x & ((1<<55) - 1)) * mmap.PAGESIZE for x in array.array('Q', self.pagemap.read(size//mmap.PAGESIZE*8, binary=True))]
 
@@ -128,6 +132,7 @@ class _System:
   @functools.cache
   def list_devices(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
     if getenv("REMOTE", ""): return RemotePCIDevice.scan(vendor, devices, base_class)
+    if OSX: return [(TinyGPUPCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
     return [(PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
 
   def pci_probe_device(self, device:str, dev_id:int, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
@@ -198,6 +203,48 @@ class _System:
     except OSError: raise RuntimeError(f"Failed to acquire lock file {name}. `sudo lsof {lock_name}` may help identify the process holding the lock.")
 
     return self.lock_fd
+
+  # *** macOS: memory the GPU can reach is allocated by the TinyGPU server (MAP_SYSMEM_FD), there is no pagemap to translate other memory.
+  # dma_regions records every such mapping (cpu address == gpu va, page paddrs). host (CPU device) buffers are sub-allocated from big arenas
+  # because the server keeps at most 128 allocations and can't free them
+
+  dma_dev:Any = None
+  dma_regions:dict[int, tuple[int, list[int]]] = {} # cpu address (== gpu va) -> (size, page paddrs)
+  dma_arenas:list[tuple[FileIOInterface, list[int], TLSFAllocator]] = [] # (shm fd, page paddrs, offset allocator)
+  dma_host:dict[int, tuple[TLSFAllocator, int, int]] = {} # host buffer address -> (its arena's allocator, offset, size)
+
+  def dma_paddrs(self, vaddr:int, size:int) -> list[int]:
+    for va, (sz, paddrs) in self.dma_regions.items():
+      if va <= vaddr and vaddr + size <= va + sz: return paddrs[(vaddr - va) // 0x1000:(vaddr - va + round_up(size, 0x1000)) // 0x1000]
+    raise RuntimeError(f"host memory at {vaddr:#x} is not GPU-mappable on macOS (allocated before the eGPU was opened?)")
+
+  def dma_alloc(self, size:int, vaddr:int=0) -> tuple[MMIOInterface, list[int]]:
+    """a piece of a TinyGPU arena mapped at vaddr (or anywhere). the server keeps at most 128 allocations and can't free them"""
+    size = round_up(size, mmap.PAGESIZE) # 16KB pages on apple silicon: offsets and fixed addresses must be page aligned
+    for fd, apaddrs, tlsf in self.dma_arenas:
+      try: off = tlsf.alloc(size, mmap.PAGESIZE)
+      except MemoryError: continue
+      addr = fd.mmap(vaddr, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | (MAP_FIXED if vaddr else 0), off)
+      self.dma_regions[addr] = (size, paddrs:=apaddrs[off // 0x1000:(off + size) // 0x1000])
+      self.dma_host[addr] = (tlsf, off, size)
+      return MMIOInterface(addr, size, fmt='B'), paddrs
+    asz = max(getenv("TINYGPU_ARENA", 1 << 30), round_up(size, 2 << 20))
+    self.dma_arenas.append((*self.dma_dev.alloc_arena(asz), TLSFAllocator(asz)))
+    return self.dma_alloc(size, vaddr)
+
+  def host_dma_alloc(self, size:int) -> MMIOInterface|None:
+    if self.dma_dev is None: return None
+    from tinygrad.runtime.support.memory import MemoryManager
+    return self.dma_alloc(size, MemoryManager.alloc_vaddr(round_up(size, mmap.PAGESIZE), align=mmap.PAGESIZE))[0]
+
+  def host_dma_free(self, addr:int):
+    from tinygrad.runtime.support.memory import MemoryManager
+    tlsf, off, size = self.dma_host.pop(addr)
+    del self.dma_regions[addr]
+    tlsf.free(off)
+    # keep the range reserved (PROT_NONE) instead of unmapping: nothing else may land in the gpu va window
+    FileIOInterface.anon_mmap(addr, size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_FIXED, 0)
+    MemoryManager.va_allocator.free(addr)
 
 System = _System()
 
@@ -309,7 +356,9 @@ class PCIIfaceBase:
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
             **kwargs) -> BufferStorage:
-    should_use_sysmem = host or (cpu_access and self.is_bar_small() and not force_devmem)
+    # tinygpu: the cpu can't map the BARs, everything it touches lives in sysmem
+    bar_unmappable = getattr(self.pci_dev, "tinygpu", False)
+    should_use_sysmem = host or (cpu_access and (self.is_bar_small() or bar_unmappable) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
@@ -326,7 +375,8 @@ class PCIIfaceBase:
 
   def free(self, storage:BufferStorage):
     if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
-    if storage.meta.has_cpu_mapping and self.remote is None: FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
+    if storage.meta.has_cpu_mapping and storage.buf in System.dma_host: System.host_dma_free(storage.buf) # tinygpu arena piece
+    elif storage.meta.has_cpu_mapping and self.remote is None: FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
 
   def unmap(self, mapping:BufferStorage): self.dev_impl.mm.unmap_range(*mapping.meta)
 
@@ -449,5 +499,79 @@ class RemotePCIDevice(PCIDevice):
   def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
     _, sz, host_va = self._bar(bar)
     return RemoteMMIOInterface(self, bar, host_va + off, size or (sz - off), fmt, off=off)
+
+# *** macOS eGPU (USB4/Thunderbolt): the TinyGPU app owns the device and serves its BARs, config space and DMA memory on a unix socket
+
+class TinyGPUMMIOInterface(MMIOInterface):
+  # a BAR mapped in the TinyGPU server: reads are round trips, writes are posted
+  def __init__(self, dev:TinyGPUPCIDevice, residx:int, nbytes:int, fmt='B', off=0):
+    self.dev, self.residx, self.nbytes, self.fmt, self.off, self.el_sz = dev, residx, nbytes, fmt, off, struct.calcsize(fmt)
+  def __getitem__(self, k):
+    sl = k if isinstance(k, slice) else slice(k, k + 1)
+    st, en = (sl.start or 0) * self.el_sz, (sl.stop or len(self)) * self.el_sz
+    data = self.dev.rpc(RemoteCmd.MMIO_READ, self.off + st, en - st, bar=self.residx, readout_size=en - st)[2]
+    res = data if self.fmt == 'B' else list(struct.unpack(f'<{(en - st) // self.el_sz}{self.fmt}', data))
+    return res if isinstance(k, slice) else res[0]
+  def __setitem__(self, k, v):
+    st = ((k.start or 0) if isinstance(k, slice) else k) * self.el_sz
+    data = (bytes(v) if self.fmt == 'B' else struct.pack(f'<{len(v)}{self.fmt}', *v)) if isinstance(k, slice) else struct.pack(f'<{self.fmt}', v)
+    self.dev.sock.sendall(struct.pack(REMOTE_REQ, RemoteCmd.MMIO_WRITE, self.dev.dev_id, self.residx, self.off + st, len(data), 0) + data)
+  def view(self, offset:int=0, size:int|None=None, fmt=None) -> MMIOInterface:
+    return TinyGPUMMIOInterface(self.dev, self.residx, size or (self.nbytes - offset), fmt or self.fmt, self.off + offset)
+
+class TinyGPUPCIDevice(PCIDevice):
+  """the BARs are mapped only in the server: python reaches them by rpc, host programs by MMIO_WRITE packets on the socket (ops_amd).
+  DMA memory comes from server allocated shared memory arenas, mapped at the gpu va so cpu address == gpu va, like on linux"""
+  APP_PATH, COMMIT, tinygpu = "/Applications/TinyGPU.app/Contents/MacOS/TinyGPU", "c0d024f9ff0e1dc8fdf217f255da7101d91e8323", True
+
+  @classmethod
+  def ensure_app(cls):
+    if (_ensure_downloads_dir() / (app_name:=f"TinyGPU_{cls.COMMIT}.zip")).is_file() and os.path.exists(cls.APP_PATH): return
+    print("Downloading TinyGPU.app...")
+    with contextlib.suppress(RuntimeError): system("pkill -f TinyGPU")
+    system(f"ditto -xk {fetch(f'https://github.com/tinygrad/tinygpu_releases/raw/{cls.COMMIT}/TinyGPU.zip', name=app_name)} /Applications")
+    print(system(f"{cls.APP_PATH} install"))
+
+  def __init__(self, devpref:str, pcibus:str):
+    self.ensure_app()
+    sock_path, self.sock = getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    for i in range(100):
+      with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
+        self.sock.connect(sock_path)
+        break
+      if i == 0: subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+      time.sleep(0.05)
+    else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): self.sock.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
+    self.pcibus, self.dev_id, self.irq_poller = "usb4", 0, None
+    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_usb4.lock")
+    System.dma_dev = self
+
+  def rpc(self, cmd:RemoteCmd, *args:int, bar:int=0, readout_size:int=0, has_fd=False) -> tuple[int, int, bytes, int|None]:
+    self.sock.sendall(struct.pack(REMOTE_REQ, cmd, self.dev_id, bar, *(*args, 0, 0, 0)[:3]))
+    if has_fd:
+      msg, anc, _, _ = self.sock.recvmsg(17, socket.CMSG_LEN(4))
+      fd = struct.unpack('<i', anc[0][2][:4])[0] if anc else None
+    else: msg, fd = RemotePCIDevice._recvall(self.sock, 17), None
+    if (resp:=struct.unpack(REMOTE_RESP, msg))[0] != 0: raise RuntimeError(f"TinyGPU {cmd.name} failed")
+    return resp[1], resp[2], RemotePCIDevice._recvall(self.sock, readout_size), fd
+
+  def alloc_arena(self, size:int) -> tuple[FileIOInterface, list[int]]:
+    mapped, _, _, fd = self.rpc(RemoteCmd.MAP_SYSMEM_FD, size, 0, has_fd=True)
+    if fd is None: raise RuntimeError("TinyGPU server is out of DMA allocations (128 max), restart it")
+    # the server writes the (paddr, size) segments, zero terminated, at the start of the shared memory
+    table = MMIOInterface((f:=FileIOInterface(fd=fd)).mmap(0, 8192, mmap.PROT_READ, mmap.MAP_SHARED, 0), 8192, fmt='Q')[:]
+    segs = list(itertools.takewhile(lambda p: p[1] != 0, zip(table[0::2], table[1::2])))
+    return f, [p + i for p, sz in segs for i in range(0, sz, 0x1000)][:mapped // 0x1000]
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]: return System.dma_alloc(size, vaddr)
+
+  def reset(self): self.rpc(RemoteCmd.RESET)
+  def read_config(self, offset:int, size:int): return self.rpc(RemoteCmd.CFG_READ, offset, size)[0]
+  def write_config(self, offset:int, value:int, size:int): self.rpc(RemoteCmd.CFG_WRITE, offset, size, value)
+  @functools.cache
+  def bar_info(self, bar_idx:int) -> tuple[int, int]: return self.rpc(RemoteCmd.MAP_BAR, bar=bar_idx)[:2]
+  def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
+    return TinyGPUMMIOInterface(self, bar, size or (self.bar_info(bar)[1] - off), fmt, off)
+  def resize_bar(self, bar_idx:int): self.rpc(RemoteCmd.RESIZE_BAR, bar=bar_idx)
 
 if DEV.interface.startswith("MOCK"): from test.mockgpu.mockgpu import MockFileIOInterface as FileIOInterface  # noqa: F401 # pylint: disable=unused-import

@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace, field
 from collections import defaultdict
 from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
 import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics
-from tinygrad.helpers import mv_address, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
+from tinygrad.helpers import OSX, mv_address, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up, is_numpy_ndarray
 from tinygrad.helpers import cpu_profile, perf_counter_us, to_name, HCQ_RUNTIME_DEV
@@ -289,15 +289,24 @@ class Allocator(Generic[DeviceType]):
   def _offset(self, buf, size:int, offset:int): raise NotImplementedError("need offset")
   # def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
 
+def _host_dma_alloc(size:int) -> MMIOInterface|None:
+  from tinygrad.runtime.support.system import System
+  return System.host_dma_alloc(size)
+def _host_dma_free(addr:int):
+  from tinygrad.runtime.support.system import System
+  System.host_dma_free(addr)
+
 class HostAllocator(Allocator):
   def __init__(self, dev): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.external_ptr is not None: view, meta = self._view(options.external_ptr, size), None
     elif (remote:=getattr(self.dev, "remote", None)) is not None: view, meta = remote.alloc_sysmem(round_up(size, mmap.PAGESIZE))
+    elif OSX and (dma:=_host_dma_alloc(size)) is not None: view, meta = dma, "dma"  # macOS eGPU: host memory from the TinyGPU arenas
     else: view = self._view(mv_address(meta:=mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)), size)
     return BufferStorage(view.addr, meta, view)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
+    if storage.meta == "dma": _host_dma_free(storage.buf)
     if (remote:=getattr(self.dev, "remote", None)) is not None:
       self.dev.synchronize()
       remote.free_sysmem(storage.host)
