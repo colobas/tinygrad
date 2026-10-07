@@ -1,12 +1,13 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib, re
 from typing import cast
+from math import prod
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.helpers import DEBUG
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, \
   gated_delta_kernel_supported
-from tinygrad.llm.gguf import gguf_parse, gguf_shard, ggml_data_to_tensor
+from tinygrad.llm.gguf import gguf_parse, gguf_shard, ggml_nbytes, ggml_data_to_tensor
 from tinygrad.uop.ops import resolve, Ops, KernelInfo
 
 def _embedding_rows_kernel(out:UOp, table:UOp, idx:UOp) -> UOp:
@@ -496,6 +497,7 @@ class Transformer:
     self.max_context = config.max_context
     self.embd_packed:tuple[Tensor, int]|None = None # (packed token_embd rows as u32 words, ggml type), set by from_gguf for quantized tables
     self.prefill_chunk = 32 # prompt tokens per prefill forward (more amortizes the weight streaming, the jit binds it as the toks range)
+    self.extras: dict[str, Tensor] = {}  # tensors outside the LM (the clef decision head), see from_gguf
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
@@ -518,6 +520,13 @@ class Transformer:
     rows = Tensor.custom_kernel(rows, table, padded, fxn=_embedding_rows_kernel)[0]
     x = ggml_data_to_tensor(rows.bitcast(dtypes.uint8).flatten(), m * dim, ggml_type).reshape(m, dim)
     return x[:n].reshape(*tokens.shape, dim).float()
+
+  def forward_hidden(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    """final-norm hidden states of every token (B, T, D), for models that consume the hidden states instead of sampling (clef)"""
+    clear_activation_memos()
+    x = self.embed(tokens)  # (B, T, D)
+    for block in self.blk: x = block(x, start_pos)
+    return self.output_norm(x)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self._run_blocks(tokens, start_pos)
@@ -570,6 +579,17 @@ class Transformer:
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     embd_type = entries['token_embd.weight'][2]
+    # clef: the decision head and the output embedding are not LM weights. the head is decoded to float32 on the default device, the output
+    # embedding stays packed: only the rows of a request's option tokens are read (and dequantized)
+    extras: dict[str, Tensor] = {}
+    if arch == 'clef':
+      assert shard == 1, "clef does not support tensor parallel"
+      for k in [k for k in entries if k.startswith(('dec.', 'decision.', 'token_types'))]:
+        data, shape, typ = entries.pop(k)
+        extras[k] = ggml_data_to_tensor(data.to(Device.DEFAULT), prod(shape), typ).reshape(shape).float()
+      data, (vocab, dim), typ = entries.pop('output.weight')
+      extras['output.raw'], extras['output.ggml_type'] = data.to(Device.DEFAULT).reshape(vocab, ggml_nbytes(dim, typ)).contiguous(), Tensor([typ])
+      entries['output.weight'] = (Tensor.zeros(2, dtype=dtypes.uint8), (1, 1), 24)  # stub: nothing samples tokens
     state_dict = gguf_shard(entries, devices, shard_map)
     # a quantized embedding table: keep a view of its packed rows, the lookup gathers and dequantizes only those (the whole dequantized
     # table would otherwise be materialized in every JIT)
@@ -585,7 +605,7 @@ class Transformer:
 
     ssm = None
     ssm_layers: tuple[bool, ...] = ()
-    if arch in ('qwen35', 'qwen35moe'):
+    if arch in ('qwen35', 'qwen35moe', 'clef'):
       ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')})
       ssm_layers = tuple((i+1) % kv[f'{arch}.full_attention_interval'] != 0 for i in range(kv[f'{arch}.block_count']))
     elif arch == 'kimi-linear':
@@ -599,7 +619,7 @@ class Transformer:
         state_dict[f"blk.{i}.ssm_conv1d.weight"] = state_dict.pop(f"blk.{i}.ssm_conv1d_q.weight").cat(
           state_dict.pop(f"blk.{i}.ssm_conv1d_k.weight"), state_dict.pop(f"blk.{i}.ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
-    if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
+    if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss', 'clef'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
     # MTP (nextn) blocks trail the main ones: blk.{main+k}.nextn.{enorm,hnorm,eh_proj,shared_head_norm} -> mtp_heads.{k}.*, the rest of
     # blk.{main+k} -> mtp_heads.{k}.block.*. its embed_tokens is the main token_embd
@@ -655,7 +675,7 @@ class Transformer:
         kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0)),
       shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict,
       dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
-      routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
+      routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe', 'clef'), ssm=ssm,
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
@@ -667,6 +687,7 @@ class Transformer:
       num_mtp_heads=num_mtp, mtp_ssm_layer=mtp_ssm_layer)
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
+    if extras: model.output = Linear(1, 1, bias=False)  # matches the output.weight stub above
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -678,6 +699,7 @@ class Transformer:
     # constructing the model drew every weight from the rng (then replaced by the gguf ones): the counter is a long lazy add chain that
     # every later realize would walk (_apply_map_to_tensors). run it once
     Tensor.realize(*Tensor._device_rng_counters.values())
+    model.extras = extras  # last: get_state_dict (load_state_dict, linears) would treat these as weights
     return model, kv
 
   def warmup(self):
