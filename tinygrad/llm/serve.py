@@ -96,7 +96,8 @@ class Handler(VizHandler):
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      gen = model.generate_mtp(ids, model.mtp_K, temperature=temperature) if model.mtp_K else model.generate(ids, temperature=temperature)
+      mtp = self.server.mtp
+      gen = model.generate_mtp(ids, mtp, temperature=temperature) if mtp else model.generate(ids, temperature=temperature)
       for next_id in gen:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
@@ -172,6 +173,7 @@ class Handler(VizHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any, mtp:int=0):
+    self.mtp = mtp # > 0: speculative-decode this many draft tokens per step with the model's MTP head
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
     super().__init__(server_address, Handler)

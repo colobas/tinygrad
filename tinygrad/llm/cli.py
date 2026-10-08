@@ -187,8 +187,7 @@ def main():
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
-  model.mtp_K = args.mtp # the server routes generation through generate_mtp
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template, mtp=args.mtp).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
