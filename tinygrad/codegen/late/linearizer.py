@@ -16,8 +16,9 @@ def linearize(sink:UOp) -> list[UOp]:
   for u in reversed(lst):
     for s in u.src_without_body: out_degree[s] += 1
 
-    # we place UOps with higher run_counts later
-    run_count = prod([int(r.vmax)+1 for r in u.ranges])
+    # we place UOps with higher run_counts later. a loop counts at least 2 even if it runs at most once (a symbolic trip count with vmax 0):
+    # otherwise its body ties with the code outside it, and a value shared by both can be placed inside the loop and read after it
+    run_count = prod([max(int(r.vmax)+1, 2) for r in u.ranges])
 
     # simple priority override. this is all bottom up now, smaller numbers will be closer to the top
     extra = None
