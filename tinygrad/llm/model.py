@@ -553,6 +553,9 @@ class Transformer:
     # last: get_state_dict (load_state_dict, linears) would take it for a weight
     if shard == 1 and embd_raw is not None and embd_raw.max_numel() % (4 * (vocab:=config.vocab_size)) == 0:
       model.embd_packed = (Tensor(embd_raw).bitcast(dtypes.uint32).reshape(vocab, -1).clone().realize(), embd_type) # one copy, as u32 words
+    # constructing the model drew every weight from the rng (then replaced by the gguf ones): the counter is a long lazy add chain that
+    # every later realize would walk (_apply_map_to_tensors). run it once
+    Tensor.realize(*Tensor._device_rng_counters.values())
     return model, kv
 
   def warmup(self):
