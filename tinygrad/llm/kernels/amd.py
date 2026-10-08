@@ -16,11 +16,13 @@ LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_N, WMMA_M, WMMA_K), 32), math.log2(math.e)
 GGML_BLOCK_SIZE, Q8_GROUP_SIZE = 256, 32
 Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 8, 10, 11, 12, 13, 14
 IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS = 17, 18, 20, 21, 22, 23
+# 1-bit Bonsai (Q1_0, value 2*bit-1) and PrismML ternary (PQ2_0, value code-1): f16 scale + byte-sequential codes per 128 weights
+Q1_0, PQ2_0 = 41, 142
 QUANT_SIZES = {Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210, IQ2_XS: 74,
-               IQ3_XXS: 98, IQ4_NL: 144, IQ3_S: 110, IQ2_S: 82, IQ4_XS: 136, Q8_0: 272}  # bytes per 256 weights
-HALFWORD_QUANTS = (Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, Q8_0)
-QUANT_NAMES = {Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
-               IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s", Q8_0: "q8_0"}
+               IQ3_XXS: 98, IQ4_NL: 144, IQ3_S: 110, IQ2_S: 82, IQ4_XS: 136, Q8_0: 272, Q1_0: 36, PQ2_0: 68}  # bytes per 256 weights
+HALFWORD_QUANTS = (Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, Q8_0, Q1_0, PQ2_0)
+QUANT_NAMES = {Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs", IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs",
+               IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s", Q8_0: "q8_0", Q1_0: "q1_0", PQ2_0: "pq2_0"}
 
 def _unbind(v:int|UOp) -> int|UOp: return v.unbind_all()[0] if isinstance(v, UOp) else v
 
@@ -263,10 +265,22 @@ def _iq_signed_word(word:UOp, signs:UOp) -> UOp:
   # Grid magnitudes are nonzero and <128, so each byte can be negated without a carry into its neighbor.
   return (word ^ mask) + (mask & 0x01010101)
 
+def _block128(raw:UOp, base:UOp, subgroup:UOp, ggml_type:int) -> tuple[UOp, UOp]:
+  # Q1_0/PQ2_0 come in 128 weight blocks: the 256 weight group's subgroup -> (block base, 32 weight subgroup within it)
+  return base + (subgroup//4) * (QUANT_SIZES[ggml_type]//2//raw.dtype.itemsize), subgroup%4
+
 def _quant_word(raw:UOp, base:UOp, subgroup:UOp, i:int|UOp, ggml_type:int, grid:UOp|None) -> UOp:
   # Four packed weight bytes, shared by integer-dot decode and FP16 WMMA prefill.
   def byte(offset): return _load_byte(raw, base, offset)
   def word(offset): return _load_u32(raw, base, offset, stream=ggml_type == Q6_K)
+  if ggml_type == PQ2_0: # byte i holds 4 two-bit codes: spread them to the 4 byte lanes
+    b, sub = _block128(raw, base, subgroup, ggml_type)
+    code = (_load_u32(raw, b, 2+sub*8+(i//4)*4) >> ((i%4)*8)) & 255 # two word loads per 32 weights
+    return (code | (code << 6) | (code << 12) | (code << 18)) & 0x03030303
+  if ggml_type == Q1_0: # half a byte: 4 bits to the 4 byte lanes
+    b, sub = _block128(raw, base, subgroup, ggml_type)
+    bits = (_load_u32(raw, b, 2+sub*4) >> (i*4)) & 15 # one word load per 32 weights
+    return (bits | (bits << 7) | (bits << 14) | (bits << 21)) & 0x01010101
   if ggml_type in (Q4_K, Q5_K):
     offset = (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8
     weights = (_amd_load(raw[base+offset], 8)[i] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
@@ -312,7 +326,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
     def word(offset): return _load_u32(raw, base, offset)
     xwords = _amd_load(xq[token, group, 0], 8)
     # One accumulator per scale group: 32 weights for Q4/Q5/IQ4_XS, two groups of 16 otherwise.
-    dots = [UOp.const(0, dtypes.int32)] * (1 if ggml_type in (Q4_K, Q5_K, IQ4_XS) else 2)
+    dots = [UOp.const(0, dtypes.int32)] * (1 if ggml_type in (Q4_K, Q5_K, IQ4_XS, Q1_0, PQ2_0) else 2)
     for i in range(8):
       weights = _quant_word(raw, base, subgroup, i, ggml_type, grids[0] if grids else None)
       acc = i//(8//len(dots))
@@ -322,6 +336,9 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
       total = dots[0].float()*d*scale - (xs[token, group, 0].load()+xs[token, group, 1].load())*dmin*minimum
     elif ggml_type == IQ4_XS:
       total = dots[0].float() * _iq4_scale(raw, base, subgroup)
+    elif ggml_type in (Q1_0, PQ2_0): # the -1 of every weight comes out of the activation sum
+      gsum = xs[token, group, 0].load() + xs[token, group, 1].load()
+      total = ((2 if ggml_type == Q1_0 else 1)*dots[0].float() - gsum) * _half(raw[_block128(raw, base, subgroup, ggml_type)[0]])
     elif ggml_type == Q6_K:
       # Subtract the quant offset via the activation sums instead of unpacking signed bytes.
       scales = [(raw[base+96+subgroup] >> (h*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() for h in range(2)]
@@ -466,6 +483,9 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
       scale, zero = _half(raw[base+54])*(sc.cast(dtypes.int32)-32).float(), 4
     elif ggml_type == Q6_K:
       scale, zero = _half(raw[base+104])*byte(192+subgroup*2+half).cast(dtypes.uint8).bitcast(dtypes.int8).float(), 32
+    elif ggml_type in (Q1_0, PQ2_0): # (bit-0.5)*2d and (code-1)*d
+      d = _half(raw[_block128(raw, base, subgroup, ggml_type)[0]])
+      scale, zero = (2*d, 0.5) if ggml_type == Q1_0 else (d, 1)
     else:
       scale = _half(raw[base])
       if ggml_type in (IQ2_XS, IQ2_S):
