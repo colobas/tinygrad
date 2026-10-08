@@ -500,7 +500,6 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
     # MTP speculative decoding: one jit per draft step and one for the verify window (generate_mtp)
     self.mtp_heads:list[MTPHead] = [MTPHead(config) for _ in range(config.num_mtp_heads)]
-    self.mtp_K = 0 # draft tokens per step when > 0 (the --mtp flag), the server routes generation through generate_mtp
     self._mtp_cache:tuple|None = None # (K, commit jits per accept length, draft jits per step, verify jit)
 
   def embed(self, tokens:Tensor) -> Tensor:
