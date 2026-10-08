@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.helpers import DEBUG
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, \
-  gated_delta_kernel_supported
+  gated_delta_kernel_supported, is_metal
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, ggml_data_to_tensor
 from tinygrad.uop.ops import resolve, Ops, KernelInfo
 
@@ -703,6 +703,13 @@ class Transformer:
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     if 'prism.hadamard.version' in kv: Transformer._attach_hadamard(model, kv, len(model.blk))
+    if is_metal(model.token_embd.weight.device):
+      # Apple GPUs: re-pack Q1_0 for kernels/metal.py now, one linear at a time (each source buffer is freed as its copy is made)
+      for name in [k[:-len('.weight')] for k in nn.state.get_state_dict(model) if k.endswith('.weight')]:
+        obj:object = model
+        for part in name.split('.'): obj = obj[int(part)] if isinstance(obj, list) else getattr(obj, part)
+        if isinstance(obj, Linear): obj.prepare_metal()
+      if lowbit: model.prefill_chunk = 512 # full 512-token chunks ran at ~97 tok/s vs ~85 at 128; the prompt tail goes through the tail jit
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
