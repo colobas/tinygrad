@@ -1,7 +1,9 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib, re
+from typing import cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
+from tinygrad.helpers import DEBUG
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, ggml_data_to_tensor
 from tinygrad.uop.ops import resolve, Ops, KernelInfo
@@ -115,6 +117,8 @@ class TransformerConfig:
   swiglu_up_bias: float = 0.0
   sliding_window: int = 0
   sliding_window_pattern: int = 0
+  num_mtp_heads: int = 0  # trailing MTP (nextn) blocks, for speculative decoding (generate_mtp)
+  mtp_ssm_layer: bool = False  # the MTP block is a GatedDeltaNetBlock (vs an attention block)
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -177,13 +181,20 @@ class FFNBlock:
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
+  # MTP speculative decoding (Transformer.generate_mtp). a KV cache block verifies like it decodes: a rejected draft's keys sit past the
+  # committed length and are overwritten by the next round. recurrent blocks override these to keep their state untouched until commit
+  def _attention_verify(self, x:Tensor, start_pos:int|UOp) -> Tensor: return self._attention(x, start_pos)
+  def _init_verify_state(self, x:Tensor) -> None: pass # eager, before the traced region (like _init_state)
+  def commit_verify(self, accept:int) -> list[UOp]: return [] # the state writes that land the accepted prefix
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  def __call__(self, x: Tensor, start_pos: int|UOp, verify:bool=False):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
+    if verify: self._init_verify_state(x)
+    attn_fn = self._attention_verify if verify else self._attention
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+      h =     x + attn_fn(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
@@ -325,7 +336,8 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _project(self, x:Tensor, start_pos:int|UOp):
+    """conv window and q/k/v/beta/alpha/out_gate, shared by the scan (_attention) and the MTP verify window (_attention_verify)"""
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
@@ -367,6 +379,12 @@ class GatedDeltaNetBlock(FFNBlock):
     q = q * self.head_k_dim**-0.5
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
 
+    return q, k, v, beta, alpha, out_gate, conv_state_store, conv_window, initial, is_kda, symbolic, T_pad, start_pos
+
+  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    B, T, _ = x.shape
+    q, k, v, beta, alpha, out_gate, conv_state_store, _, initial, is_kda, symbolic, T_pad, start_pos = self._project(x, start_pos)
+
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
@@ -388,14 +406,76 @@ class GatedDeltaNetBlock(FFNBlock):
       core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
 
     # output; undo the padding before the output projection
-    z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
+    z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(dtypes.half).contiguous()
     if symbolic: z = z[:, :T]
     return self.ssm_out(z.reshape(B, T, -1))
+
+  # MTP verify window stashes (see _init_verify_state)
+  _verify_N: int
+  _verify_q: Tensor
+  _verify_k: Tensor
+  _verify_v: Tensor
+  _verify_beta: Tensor
+  _verify_alpha: Tensor
+  _verify_conv_window: Tensor
+
+  def _attention_verify(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    """the N=K+1 token verify window, on a COPY of the recurrent state: the committed state must not move before the accept length is
+    known. the projected operands and the conv window are stashed so commit_verify can land the accepted prefix on the real state"""
+    B, N, _ = x.shape
+    q, k, v, beta, alpha, out_gate, _, conv_window, initial, is_kda, symbolic, T_pad, start_pos = self._project(x, start_pos)
+    assert isinstance(N, int) and not symbolic and T_pad == N and not is_kda, "verify: a static window, scalar-alpha gated delta rule"
+    # the conv_state store of _project is not threaded in: verify must be free of side effects, only commit_verify writes state
+    core = gated_delta_prefill(q, k, v, beta, alpha, initial.where(0, self.recurrent_state.float()).contiguous()).transpose(1, 2)
+    stores = self._verify_q.uop.store(q.contiguous().uop)
+    for buf, val in ((self._verify_k, k), (self._verify_v, v), (self._verify_beta, beta), (self._verify_alpha, alpha),
+                     (self._verify_conv_window, conv_window)):
+      stores = buf.uop.after(stores).store(val.contiguous().uop)
+    z = (self.ssm_norm(core) * out_gate.silu()).cast(dtypes.half).contiguous()
+    return Tensor(self.ssm_out(z.reshape(B, N, -1)).contiguous().uop.after(stores)) # realizing the output fires the stashes
+
+  def commit_verify(self, accept:int) -> list[UOp]:
+    """land the state after the accepted prefix (window positions 0..accept): rerun the fused scan on the real state with the rejected
+    tail as no-ops (beta=0: no delta update, alpha=1: no decay). returns reads after the writes, which is what makes a realize fire them"""
+    if not hasattr(self, "_verify_q"): return []
+    N, keep = self._verify_N, (Tensor.arange(self._verify_N) <= accept).float()
+    beta = self._verify_beta * keep.reshape(1, 1, N)
+    alpha = self._verify_alpha * keep.reshape(1, 1, N, 1) + (1 - keep).reshape(1, 1, N, 1)
+    core = gated_delta_prefill(self._verify_q, self._verify_k, self._verify_v, beta, alpha, Tensor(self.recurrent_state.uop))
+    # the conv state of the prefix is the kernel-1 window columns ending at accept+1 (a static slice: accept is a python int)
+    conv_store = self.conv_state.uop.store(self._verify_conv_window[:, accept+1:accept+self.ssm_conv_kernel].cast(self.conv_state.dtype)
+                                           .contiguous().uop)
+    return [core.uop, self.conv_state.uop.after(conv_store)]
+
+  def _init_verify_state(self, x:Tensor) -> None:
+    B, N = x.shape[0], x.shape[1]
+    assert isinstance(N, int), "the verify window is static (K is fixed for a generate_mtp run)"
+    if hasattr(self, "_verify_q") and self._verify_N == N: return
+    H, Dk, Dv, dev = self.num_v_heads, self.head_k_dim, self.head_v_dim, x.device
+    # zeros, never empty: commit_verify reads them, a stray NaN would poison every later state
+    def z(*shape) -> Tensor: return Tensor.zeros(*shape, device=dev).contiguous().realize()
+    self._verify_N, self._verify_q, self._verify_k, self._verify_v = N, z(B, H, N, Dk), z(B, H, N, Dk), z(B, H, N, Dv)
+    self._verify_beta, self._verify_alpha = z(B, H, N), z(B, H, N, 1)
+    self._verify_conv_window = z(B, self.ssm_conv_kernel-1+N, self.conv_channels)
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+
+class MTPHead:
+  """the trailing multi-token-prediction ("nextn") block: from the main model's pre-norm hidden state at t and the embedding of the token
+  at t+1 it predicts the token at t+2. it reuses token_embd and output, with its own norms, eh_proj and final norm (shared_head_norm is not
+  tied to output_norm)"""
+  def __init__(self, config:TransformerConfig):
+    self.enorm, self.hnorm = nn.RMSNorm(config.dim, config.norm_eps), nn.RMSNorm(config.dim, config.norm_eps)
+    self.eh_proj = Linear(2*config.dim, config.dim, bias=False)
+    self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.block:FFNBlock = GatedDeltaNetBlock(config, config.ssm) if config.mtp_ssm_layer and config.ssm else \
+      (MLATransformerBlock(config) if config.kv_lora_rank > 0 else TransformerBlock(config))
+  def __call__(self, h_prev:Tensor, tok_embed:Tensor, start_pos:int|UOp) -> Tensor:
+    # [enorm(embed); hnorm(h)]: the Qwen3.5+ family concatenates in the opposite order from DeepSeek-V3
+    return self.block(self.eh_proj(self.enorm(tok_embed).cat(self.hnorm(h_prev), dim=-1)), start_pos)
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -418,6 +498,10 @@ class Transformer:
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    # MTP speculative decoding: one jit per draft step and one for the verify window (generate_mtp)
+    self.mtp_heads:list[MTPHead] = [MTPHead(config) for _ in range(config.num_mtp_heads)]
+    self.mtp_K = 0 # draft tokens per step when > 0 (the --mtp flag), the server routes generation through generate_mtp
+    self._mtp_cache:tuple|None = None # (K, commit jits per accept length, draft jits per step, verify jit)
 
   def embed(self, tokens:Tensor) -> Tensor:
     if self.embd_packed is None: return self.token_embd(tokens.to(self.token_embd.weight.device)).float()
@@ -431,13 +515,33 @@ class Transformer:
     return x[:n].reshape(*tokens.shape, dim).float()
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    clear_activation_memos()  # per-forward memo of shared q8 activation quantizations (kernels/amd.py q8_quantize)
-    x = self.embed(tokens)  # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    x = self._run_blocks(tokens, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+
+  def _run_blocks(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
+    clear_activation_memos()  # per-forward memo of shared q8 activation quantizations (kernels/amd.py q8_quantize)
+    x = self.embed(tokens)  # (B, T, D)
+    for block in self.blk: x = block(x, start_pos, verify=verify)
+    return x
+
+  @staticmethod
+  def _sample(logits:Tensor, temperature:Tensor) -> Tensor: # Gumbel-max
+    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
+
+  def forward_verify(self, start_pos:int|UOp, temperature:Tensor, *window:Tensor) -> tuple[Tensor, Tensor]:
+    """the MTP verify window [last committed, draft_0..draft_{K-1}] (each (1, 1) on the device): the main model's token at every position,
+    and the pre-norm hidden states (they seed the next round's drafts). the outputs are copies: an intermediate buffer would not survive
+    the next replay"""
+    x = self._run_blocks(Tensor.cat(*window, dim=1).cast(dtypes.int32).contiguous(), start_pos, verify=True)
+    return self._sample(self.output(self.output_norm(x)), temperature).cast(dtypes.int32).clone(), x.clone()
+
+  def _mtp_draft_step(self, tok:Tensor, h_prev:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
+    clear_activation_memos()
+    h = self.mtp_heads[0](h_prev.contiguous(), self.embed(tok.contiguous()), start_pos)
+    return self._sample(self.output(self.mtp_heads[0].shared_head_norm(h))[:, -1:, :], temperature).cast(dtypes.int32).clone(), h.clone()
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
@@ -492,6 +596,18 @@ class Transformer:
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
+    # MTP (nextn) blocks trail the main ones: blk.{main+k}.nextn.{enorm,hnorm,eh_proj,shared_head_norm} -> mtp_heads.{k}.*, the rest of
+    # blk.{main+k} -> mtp_heads.{k}.block.*. its embed_tokens is the main token_embd
+    num_mtp = kv.get(f'{arch}.nextn_predict_layers', 0)
+    main_blocks, mtp_ssm_layer = kv[f'{arch}.block_count'] - num_mtp, False
+    for i in range(num_mtp):
+      pre = f'blk.{main_blocks+i}.'
+      state_dict.pop(pre+'embed_tokens.weight', None)
+      mtp_ssm_layer = pre+'attn_qkv.weight' in state_dict
+      for name in [n for n in state_dict if n.startswith(pre)]:
+        suffix = name[len(pre):]
+        new = f'mtp_heads.{i}.{suffix[len("nextn."):]}' if suffix.startswith('nextn.') else f'mtp_heads.{i}.block.{suffix}'
+        state_dict[new] = state_dict.pop(name)
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
@@ -514,7 +630,7 @@ class Transformer:
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = state_dict[name][:kv_lora_rank].cat(state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2), dim=0)
     config = TransformerConfig(
-      num_blocks=kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0), dim=kv[f'{arch}.embedding_length'],
+      num_blocks=main_blocks, dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
       n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
       vocab_size=len(kv['tokenizer.ggml.tokens']),
@@ -542,7 +658,8 @@ class Transformer:
       swiglu_alpha=1.702 if arch == 'gpt-oss' else 1.0, swiglu_clamp_exp=7.0 if arch == 'gpt-oss' else None,
       swiglu_up_bias=1.0 if arch == 'gpt-oss' else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
-      sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0))
+      sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0),
+      num_mtp_heads=num_mtp, mtp_ssm_layer=mtp_ssm_layer)
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
@@ -591,3 +708,58 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+  def generate_mtp(self, tokens:list[int], K:int, chunk_size:int|None=None, temperature:float=0.0):
+    """speculative decoding with the MTP head: draft K tokens in a chain, verify [last committed, drafts] in one forward, commit the
+    longest accepted prefix plus the main model's next token. recurrent blocks verify on a copy of their state and commit_verify lands
+    the accepted prefix (one jit per accept length); KV caches only ever get read up to the committed length"""
+    assert K >= 1 and self.mtp_heads, "generate_mtp needs K >= 1 and a checkpoint with MTP (nextn) blocks"
+    assert amd_custom_kernels_supported(self.token_embd.weight.device), "generate_mtp needs the AMD gated delta kernel"
+    if chunk_size is None: chunk_size = self.prefill_chunk
+    v_start_pos, v_toks = UOp.variable("start_pos", 0, self.max_context-1), UOp.variable("toks", 1, chunk_size)
+    temp, prompt_len = Tensor([temperature]), len(tokens)
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    # prefill all but the last prompt token: the verify window absorbs it as its position 0
+    start_pos = self.get_start_pos(tokens)
+    while start_pos < prompt_len - 1:
+      n_toks = min(chunk_size, prompt_len - 1 - start_pos)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      self(t[:, sp:sp+nt], sp, temp).realize()
+      start_pos += n_toks
+    ssm_blocks = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
+    if self._mtp_cache is None or self._mtp_cache[0] != K:
+      # commit_verify needs accept as a python int (a static conv window slice): one jit per accept length. one draft jit per step: step
+      # i reads step i-1's outputs, a jit never reads its own output buffer
+      def commit_all(accept:int):
+        if (stores:=[s for b in ssm_blocks for s in b.commit_verify(accept)]): Tensor.realize(*[Tensor(s) for s in stores])
+      self._mtp_cache = (K, [TinyJit(functools.partial(commit_all, a)) for a in range(K+1)], [TinyJit(self._mtp_draft_step) for _ in range(K)],
+                         TinyJit(self.forward_verify))
+    _, commit_jits, draft_jits, verify_jit = self._mtp_cache
+    # tokens and hidden states stay on the device: the drafts read the verify outputs through views at the bound accept position. the
+    # first round reads seed buffers of the same shapes (the last prompt token, no hidden state yet: it only drafts worse)
+    v_acc = UOp.variable("mtp_accept", 0, K)
+    pred = Tensor([[tokens[-1]] * (K+1)], dtype=dtypes.int32).contiguous().realize()
+    vhidden = Tensor.zeros(1, K+1, int(self.token_embd.weight.shape[1])).contiguous().realize()
+    accept, accept_hist = 0, [0] * (K+1)
+    try:
+      while len(tokens) < self.max_context - K - 1:
+        a = v_acc.bind(accept)
+        last, tok, h = pred[:, a:a+1], pred[:, a:a+1], vhidden[:, a:a+1]
+        drafts:list[Tensor] = []
+        for i in range(K):
+          tok, h = draft_jits[i](tok, h, v_start_pos.bind(start_pos+i), temp)
+          drafts.append(tok)
+        pred, vhidden = verify_jit(v_start_pos.bind(start_pos), temp, last, *drafts)
+        preds, dvals = cast(list[int], pred.reshape(K+1).tolist()), [int(d.item()) for d in drafts]
+        accept = 0
+        while accept < K and preds[accept] == dvals[accept]: accept += 1
+        committed = dvals[:accept] + [preds[accept]]
+        accept_hist[accept] += 1
+        if ssm_blocks: commit_jits[accept]()
+        tokens.extend(committed)
+        start_pos += accept + 1
+        self._cached_tokens = tokens[:-1]
+        yield from committed
+    finally:
+      if (n:=sum(accept_hist)) and DEBUG >= 1:
+        print(f"mtp accept_hist={accept_hist} mean_accept={sum(i*c for i, c in enumerate(accept_hist))/n:.3f} rounds={n}", flush=True)

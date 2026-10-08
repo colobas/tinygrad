@@ -199,6 +199,19 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor,
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = out.shape[2]
+  if isinstance(tokens:=out.shape[0], int) and 1 < tokens <= 8:
+    # a few tokens (an MTP verify window): loop them inside the workitem. the weight loads don't depend on the token, so they are shared
+    # by the unrolled loop and every weight word is read once, instead of once per token from a token-wide grid
+    rows = math.gcd(out_features, 4)
+    row, wave = UOp.range(out_features//rows, 0, AxisType.GLOBAL), UOp.range(rows, 3, AxisType.LOCAL)
+    chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
+    output, group = row*rows+wave, lane+chunk*32
+    stores = []
+    for t in range(tokens):
+      token = UOp.const(t, dtypes.weakint)
+      value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+      stores.append(out[token, output, chunk.valid(lane.eq(0))].store(warp_reduce(value, full_wave=True).cast(out.dtype)))
+    return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
   rows = math.gcd(out_features, 4)
   row = UOp.range(out.shape[0]*out_features//rows, 0, AxisType.GLOBAL)

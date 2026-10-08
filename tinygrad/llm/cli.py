@@ -95,6 +95,8 @@ models = {
   "qwen3.5:4b": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
   "qwen3.5:9b": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
   "qwen3.6:27b": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
+  # ships with the trailing MTP block (nextn_predict_layers): --mtp K speculative-decodes with it
+  "qwen3.8:27b-uncensored": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf",
   "qwen3.6:35b-a3b": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
   # pinned to the last revision with the plain IQ4_XS quant (the replacement uses mixed UD quantization)
   "qwen3.8:27b": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/b62a80264f8b0c1bb849ee1c9c487415ebeca194/Qwen3.8-27B-IQ4_XS.gguf",
@@ -143,6 +145,7 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
+  parser.add_argument("--mtp", type=int, default=0, metavar="K", help="speculative-decode K tokens per step with the checkpoint's MTP head")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=lambda s: tuple(int(x) for x in (s if "," in s else f"0,{s}").split(",", 1)), const=(0, 20),
@@ -184,6 +187,7 @@ def main():
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
+  model.mtp_K = args.mtp # the server routes generation through generate_mtp
   if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
 
   # do benchmark
@@ -211,7 +215,7 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    for next_id in model.generate(ids):
+    for next_id in (model.generate_mtp(ids, args.mtp) if args.mtp else model.generate(ids)):
       if tok.is_end(next_id):
         sys.stdout.write(dec() + "\n\n")
         break
