@@ -602,6 +602,7 @@ class Transformer:
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     embd_type = entries['token_embd.weight'][2]
+    lowbit = any(typ in (41, 142) for _, _, typ in entries.values()) # Q1_0 / PQ2_0: the int8 WMMA prefill is not weight-bound at 256
     state_dict = gguf_shard(entries, devices, shard_map)
     # a quantized embedding table: keep a view of its packed rows, the lookup gathers and dequantizes only those (the whole dequantized
     # table would otherwise be materialized in every JIT)
@@ -698,6 +699,7 @@ class Transformer:
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0),
       num_mtp_heads=num_mtp, mtp_ssm_layer=mtp_ssm_layer)
     model = Transformer(config)
+    if lowbit: model.prefill_chunk = 256
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     if 'prism.hadamard.version' in kv: Transformer._attach_hadamard(model, kv, len(model.blk))
