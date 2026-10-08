@@ -96,7 +96,8 @@ class Handler(VizHandler):
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      gen = model.generate_mtp(ids, model.mtp_K, temperature=temperature) if model.mtp_K else model.generate(ids, temperature=temperature)
+      for next_id in gen:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
