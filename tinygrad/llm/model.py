@@ -3,8 +3,13 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos
-from tinygrad.llm.gguf import gguf_parse, gguf_shard
-from tinygrad.uop.ops import resolve
+from tinygrad.llm.gguf import gguf_parse, gguf_shard, ggml_data_to_tensor
+from tinygrad.uop.ops import resolve, Ops, KernelInfo
+
+def _embedding_rows_kernel(out:UOp, table:UOp, idx:UOp) -> UOp:
+  # gather the packed rows of a quantized embedding table: only the looked up rows get dequantized, never the whole table
+  t, j = UOp.range(out.shape[0], 0), UOp.range(out.shape[1], 1)
+  return out[t, j].store(table[idx[t].load().cast(dtypes.weakint), j].load()).end(t, j).sink(arg=KernelInfo(name="embedding_rows", opts_to_apply=()))
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -406,6 +411,7 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    self.embd_packed:tuple[Tensor, int]|None = None # (packed token_embd rows as u32 words, ggml type), set by from_gguf for quantized tables
     self.prefill_chunk = 32 # prompt tokens per prefill forward (more amortizes the weight streaming, the jit binds it as the toks range)
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -413,9 +419,20 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
+  def embed(self, tokens:Tensor) -> Tensor:
+    if self.embd_packed is None: return self.token_embd(tokens.to(self.token_embd.weight.device)).float()
+    (table, ggml_type), dim = self.embd_packed, int(self.token_embd.weight.shape[1])
+    flat = tokens.to(table.device).reshape(-1).cast(dtypes.int32)
+    n, padded = flat.shape[0], flat.pad_to(flat.max_shape).contiguous() # symbolic token count: gather the max, slice the garbage off
+    m = int(padded.shape[0])
+    rows = Tensor.empty(m, table.shape[1], dtype=dtypes.uint32, device=table.device)
+    rows = Tensor.custom_kernel(rows, table, padded, fxn=_embedding_rows_kernel)[0]
+    x = ggml_data_to_tensor(rows.bitcast(dtypes.uint8).flatten(), m * dim, ggml_type).reshape(m, dim)
+    return x[:n].reshape(*tokens.shape, dim).float()
+
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     clear_activation_memos()  # per-forward memo of shared q8 activation quantizations (kernels/amd.py q8_quantize)
-    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    x = self.embed(tokens)  # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
@@ -443,7 +460,11 @@ class Transformer:
         **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2}
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
+    embd_type = entries['token_embd.weight'][2]
     state_dict = gguf_shard(entries, devices, shard_map)
+    # a quantized embedding table: keep a view of its packed rows, the lookup gathers and dequantizes only those (the whole dequantized
+    # table would otherwise be materialized in every JIT)
+    embd_raw = next((u for u in state_dict['token_embd.weight'].uop.toposort() if u.op is Ops.BUFFER and u.dtype == dtypes.uint8), None)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -529,6 +550,9 @@ class Transformer:
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
+    # last: get_state_dict (load_state_dict, linears) would take it for a weight
+    if shard == 1 and embd_raw is not None and embd_raw.max_numel() % (4 * (vocab:=config.vocab_size)) == 0:
+      model.embd_packed = (Tensor(embd_raw).bitcast(dtypes.uint32).reshape(vocab, -1).clone().realize(), embd_type) # one copy, as u32 words
     return model, kv
 
   def warmup(self):
