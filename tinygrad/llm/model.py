@@ -81,6 +81,11 @@ def hadamard_rotate(x:Tensor, block_size:int, signs:Tensor|None=None, gdn_perm:t
     hd, nk, rep = gdn_perm
     x = x.reshape(*x.shape[:-1], rep, nk, hd).transpose(-3, -2).reshape(*x.shape[:-1], n)
   if signs is not None: x = x * signs
+  if (side := math.isqrt(block_size)) ** 2 == block_size:
+    # Sylvester Hadamard is a Kronecker power, so H_b = H_s (x) H_s with s = sqrt(b): H_b vec(X) = vec(H_s X H_s) -- two s x s
+    # matmuls instead of one b x b (16x fewer flops at b=1024, and H_s is symmetric so no transposes)
+    h = hadamard_matrix(side, x.device).cast(x.dtype)
+    return (h @ x.reshape(*x.shape[:-1], n // block_size, side, side) @ h).reshape(*x.shape[:-1], n)
   h = hadamard_matrix(block_size, x.device)
   return (x.reshape(*x.shape[:-1], n // block_size, block_size) @ h.cast(x.dtype)).reshape(*x.shape[:-1], n)
 
