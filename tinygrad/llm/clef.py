@@ -111,11 +111,19 @@ class JointSchemaHead:
     return self._lin(o, pre+"_o")
   def _ffn(self, x:Tensor, pre:str) -> Tensor: return self._lin(_gelu(self._lin(x, pre+".ffn_up")), pre+".ffn_down")
 
-  def forward(self, hidden:Tensor, mem_mask:Tensor, self_mask:Tensor, glob_oh:Tensor, q_span:Tensor, o_span:Tensor, lex_m:Tensor,
-              lex_rows:Tensor, owner_oh:Tensor, type_oh:Tensor) -> Tensor:
-    """static-shape head (so it can be JIT'd). P = padded tokens, Q = padded questions, N = padded options. padded keys are masked, padded
-    options belong to no question. returns one logit per (padded) option"""
-    w = self.w
+  def forward(self, hidden:Tensor, n:Tensor, nq:Tensor, q_se:Tensor, o_se:Tensor, owner:Tensor, qtype:Tensor, lex_m:Tensor,
+              lex_rows:Tensor) -> Tensor:
+    """static-shape head (so it can be JIT'd). P = padded tokens, Q = padded questions, N = padded options. the masks are built here from
+    small descriptors: n/nq real token/question counts, (start, end) spans, the owning question of every option (-1: padding), question
+    types (-1: padding). padded keys are masked, padded options belong to no question. returns one logit per (padded) option"""
+    w, P, Q = self.w, hidden.shape[0], q_se.shape[0]
+    pos, qi = Tensor.arange(P), Tensor.arange(Q)
+    def span_mean(se:Tensor) -> Tensor:
+      st, en = se[:, 0:1], se[:, 1:2]
+      return ((pos >= st) & (pos < en)).float() / (en - st).maximum(1).float()
+    mem_mask, self_mask = (pos < n).reshape(1, 1, 1, P), (qi < nq).reshape(1, 1, 1, Q)
+    glob_oh, q_span, o_span = (pos == n - 1).float().reshape(1, P), span_mean(q_se), span_mean(o_se)
+    owner_oh, type_oh = (owner.unsqueeze(1) == qi).float(), (qtype.unsqueeze(1) == Tensor.arange(3)).float()
     hn = self._ln(hidden.float(), "decision.hidden_norm")
     memory = hn @ w["decision.proj_memory.weight"].T                                    # (P, W)
     glob = (glob_oh @ hn)[0]                                                           # last real token
@@ -150,9 +158,6 @@ class JointSchemaHead:
     P, qs = hidden.shape[0], rec.questions
     Q, all_spans = -(-len(qs) // 4) * 4, [s for q in qs for s in q.option_spans]
     N = -(-len(all_spans) // 8) * 8
-    def span_mean(spans:list[tuple[int, int]], rows:int) -> Tensor:
-      m = [[1.0 / (e - s) if s <= j < e else 0.0 for j in range(P)] for s, e in spans] + [[0.0] * P] * (rows - len(spans))
-      return Tensor(m, dtype=dtypes.float32)
     uniq = sorted({t for s, e in all_spans for t in rec.input_ids[s:e]})
     U, col = -(-len(uniq) // 64) * 64, {t: i for i, t in enumerate(uniq)}
     lex_m = [[0.0] * U for _ in range(N)]
@@ -160,11 +165,12 @@ class JointSchemaHead:
       for t in rec.input_ids[s:e]: lex_m[i][col[t]] += 1.0 / (e - s)
     lex_rows = Tensor.stack(*[output_rows[t] for t in uniq]).float().pad(((0, U - len(uniq)), (0, 0)))
     counts, owner = [len(q.option_spans) for q in qs], [i for i, q in enumerate(qs) for _ in q.option_spans]
-    args = (hidden, Tensor([[[[j < n_tokens for j in range(P)]]]]), Tensor([[[[j < len(qs) for j in range(Q)]] * Q]]),
-            Tensor([[1.0 if j == n_tokens - 1 else 0.0 for j in range(P)]], dtype=dtypes.float32), span_mean([q.question_span for q in qs], Q),
-            span_mean(all_spans, N), Tensor(lex_m, dtype=dtypes.float32), lex_rows,
-            Tensor([[1.0 if owner[i] == j else 0.0 for j in range(Q)] if i < len(owner) else [0.0] * Q for i in range(N)], dtype=dtypes.float32),
-            Tensor([[1.0 if i < len(qs) and qs[i].question_type == j else 0.0 for j in range(3)] for i in range(Q)], dtype=dtypes.float32))
+    i32 = dtypes.int32
+    args = (hidden, Tensor([n_tokens], dtype=i32), Tensor([len(qs)], dtype=i32),
+            Tensor([list(q.question_span) for q in qs] + [[0, 0]] * (Q - len(qs)), dtype=i32),
+            Tensor([list(sp) for sp in all_spans] + [[0, 0]] * (N - len(all_spans)), dtype=i32),
+            Tensor(owner + [-1] * (N - len(owner)), dtype=i32), Tensor([q.question_type for q in qs] + [-1] * (Q - len(qs)), dtype=i32),
+            Tensor(lex_m, dtype=dtypes.float32), lex_rows)
     if (jit:=self._jits.get(key:=(P, Q, N, U))) is None: jit = self._jits[key] = TinyJit(self.forward)
     flat, off, ret = cast(list[float], jit(*args).tolist()), 0, []
     for c in counts:
@@ -184,20 +190,25 @@ class Clef:
     Tensor.realize(*w.values())
     self.head = JointSchemaHead(w, kv["clef.decision.head_count"], kv["clef.decision.routing_block_count"], kv["clef.decision.block_count"],
                                 kv["clef.attention.layer_norm_epsilon"])
-    self.chunk = getenv("CLEF_CHUNK", 64)
-    self._hidden_jit = TinyJit(self.model.forward_hidden)
+    # full chunks of CLEF_CHUNK tokens, the rest in tail chunks of CLEF_TAIL: a prompt is padded to a multiple of the tail only
+    self.chunk, self.tail = getenv("CLEF_CHUNK", 256), getenv("CLEF_TAIL", 32)
+    self._hidden_jits = {self.chunk: TinyJit(self.model.forward_hidden), self.tail: TinyJit(self.model.forward_hidden)}
 
   def hidden_states(self, ids:list[int]) -> Tensor:
-    """final-norm hidden states of every token, (T padded up to a multiple of the chunk, dim). full static chunks go through one JIT.
+    """final-norm hidden states of every token, (T padded up to a multiple of the tail chunk, dim). static chunks, one JIT per chunk size.
     the last chunk is zero-padded: padding follows the real tokens, so the causal outputs of the real ones are unaffected"""
-    T, C = len(ids), self.chunk
-    assert T <= self.max_context
-    padded = ids + [0] * (-T % C)
+    T, C, Ct = len(ids), self.chunk, self.tail
+    assert T + Ct <= self.max_context
+    full = T // C * C
+    padded = ids + [0] * (-(T - full) % Ct)
     t = Tensor(padded, dtype="int32").reshape(1, -1).contiguous()
-    v_sp, outs = UOp.variable("start_pos", 0, self.max_context - 1), []
-    for s in range(0, len(padded), C):
+    v_sp, outs, s = UOp.variable("start_pos", 0, self.max_context - 1), [], 0
+    while s < len(padded):
+      n = C if s < full else Ct
       sp = v_sp.bind(s)
-      outs.append(self._hidden_jit(t[:, sp:sp+C].contiguous(), sp)[0])
+      # the jit's output buffer is rewritten by its next replay: copy each chunk out now
+      outs.append(self._hidden_jits[n](t[:, sp:sp+n].contiguous(), sp)[0].clone().realize())
+      s += n
     return Tensor.cat(*outs, dim=0)
 
   def output_rows(self, token_ids:list[int]) -> dict[int, Tensor]:
