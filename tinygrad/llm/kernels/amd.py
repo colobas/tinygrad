@@ -105,8 +105,39 @@ class Linear(nn.Linear):
     self.ggml_type = ggml_type
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
+  def prepare_metal(self):
+    # Apple GPUs: Q1_0 is re-packed block-major for the kernels in kernels/metal.py, everything else stays on the generic fused dequant
+    w = self.weight
+    self.set_quantized(w)
+    if self.ggml_type == Q1_0:
+      from tinygrad.llm.kernels.metal import q1_repack
+      self.weight = q1_repack(self.weight.bitcast(dtypes.uint8), self.out_features, self.in_features).realize()
+    elif self.ggml_type == Q6_K and self.out_features % 4 == 0: self.weight = self.weight.realize() # zero-copy halfword view for the gemv
+    else: self.weight, self.ggml_type, self.use_custom_quant = w, None, False
+  def _metal_q1(self, x:Tensor) -> Tensor:
+    from tinygrad.llm.kernels.metal import q1_linear, q1_dequant, q1_prefill
+    numel = x.numel()
+    if isinstance(numel, int) and numel // self.in_features < 16: out = q1_linear(self.weight, x, self.out_features, self.in_features)
+    else:
+      # prefill: a static (padded) token count; the input is made half and contiguous first, an unrealized input (silu(gate)*up, the
+      # padding) would be recomputed in every matmul tile
+      xp = (x if isinstance(numel, int) else x.pad_to(x.max_shape)).cast(dtypes.half).contiguous()
+      # Q1_QMM=1: port of mlx's qmm_t. as fast as mlx's 2-bit qmm in isolation, ~5% behind the BEAM-tuned fused dequant matmul in the model
+      if cast(int, xp.numel()) // self.in_features % 32 == 0 and self.out_features % 32 == 0 and getenv("Q1_QMM", 0):
+        out = q1_prefill(self.weight, xp, self.out_features, self.in_features)
+      else: out = xp.matmul(q1_dequant(self.weight, self.out_features, self.in_features).T, dtype=dtypes.float)
+      if not isinstance(numel, int): out = out.contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    return out if self.bias is None else out + self.bias
   def __call__(self, x:Tensor) -> Tensor:
     if self.pre_transform is not None: x = self.pre_transform(x)
+    if self.ggml_type == Q1_0 and is_metal(self.weight.device): return self._metal_q1(x)
+    if self.ggml_type == Q6_K and is_metal(self.weight.device):
+      from tinygrad.llm.kernels.metal import q6k_linear
+      if isinstance(numel:=x.numel(), int) and numel // self.in_features < 16: out = q6k_linear(self.weight, x, self.out_features, self.in_features)
+      else: # prefill: the generic fused dequant matmul on the halfword view
+        w = ggml_data_to_tensor(self.weight.bitcast(dtypes.uint8), self.out_features*self.in_features, Q6_K).reshape(self.out_features, -1)
+        out = x.linear(w.T.cast(x.dtype))
+      return out if self.bias is None else out + self.bias
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
@@ -204,8 +235,10 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
 
 _q8_memo:dict[UOp, tuple[Tensor, Tensor, Tensor]] = {}
 def clear_activation_memos():
+  from tinygrad.llm.kernels.metal import _planes_memo
   _q8_memo.clear()
   _q8_block_memo.clear()
+  _planes_memo.clear()
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
   # linears fed by the same activation (attn q/k/v, ffn gate/up) share one quantize launch: the UOp graph is hash-consed, so an
   # identical input is the same UOp object. the memo is scoped to one forward (Transformer.forward clears it): a hit from an
