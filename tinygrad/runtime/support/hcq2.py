@@ -561,6 +561,8 @@ class LinkCtx: inputs:dict[UOp, UOp]; use_rt:bool; refs:list[UOp] = field(defaul
 
 def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp: # ctx: a kept link (the jit's) owns the linear's buffers, a one-shot borrows ring slots
   dev, spec = Device[b.device], b.arg.spec or BufferSpec(cpu_access=True) # data the device reads, unless the alloc says otherwise
+  # small bar: cpu access means sysmem, kernel code there makes every instruction fetch cross the bus. upload it to vram (fold_binary)
+  if b.arg.spec is None and b.tag == "program" and getattr(getattr(dev, "iface", None), "is_bar_small", lambda: False)(): spec = BufferSpec()
 
   # a device owns the placeholders it names, the rest are allocated where they live
   if (r:=cast(Buffer|None, Compiled.pm_bufferize.rewrite(b))) is not None: pass
@@ -576,7 +578,8 @@ def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
 
 def fold_binary(buf:UOp, blob:UOp) -> UOp:
   base, off = unwrap_view(buf)
-  cast(Buffer, base.buffer).ensure_allocated().host.view(fmt='B')[off:off + len(blob.arg)] = blob.arg
+  if (host:=(b:=cast(Buffer, base.buffer).ensure_allocated()).get_storage().host) is not None: host.view(fmt='B')[off:off + len(blob.arg)] = blob.arg
+  else: b.view(len(blob.arg), off).ensure_allocated().copy_from(Buffer("PYTHON", len(blob.arg), initial_value=blob.arg))
   return UOp(Ops.NOOP)
 
 def write_words(buf:UOp, writes:list[tuple[int, int, int]]) -> UOp: # (word index, size, value)
