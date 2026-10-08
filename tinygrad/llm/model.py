@@ -523,10 +523,7 @@ class Transformer:
 
   def forward_hidden(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     """final-norm hidden states of every token (B, T, D), for models that consume the hidden states instead of sampling (clef)"""
-    clear_activation_memos()
-    x = self.embed(tokens)  # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
-    return self.output_norm(x)
+    return self.output_norm(self._run_blocks(tokens, start_pos))
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self._run_blocks(tokens, start_pos)
