@@ -39,7 +39,19 @@ def _wmma_rdna4(device:str|tuple[str, ...]) -> bool:
   if isinstance(device, tuple): device = device[0]
   with Context(ALLOW_DEVICE_USAGE=1): return getattr(Device[device], "target")[0] == 12
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def is_metal(device:str|tuple[str, ...]|None) -> bool:
+  if isinstance(device, tuple): device = device[0]
+  return device is not None and device.split(":")[0] == "METAL"
+
+def gated_delta_kernel_supported(device:str|tuple[str, ...]|None) -> bool:
+  # the fused recurrent scan only needs a 32-lane reduction: ds_swizzle on RDNA3, simd_sum on Apple GPUs
+  return amd_custom_kernels_supported(device) or is_metal(device)
+
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, metal:bool=False) -> UOp:
+  if metal: # Apple GPUs: one 32-wide simdgroup, a single simd_sum/simd_max (like mlx_lm's gated_delta kernel)
+    assert full_wave, "metal warp_reduce reduces the full 32-lane simdgroup"
+    if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
+    return UOp(Ops.CUSTOM, src=(val,), arg=(f"{'simd_max' if maximum else 'simd_sum'}({{0}})", dtypes.float))
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
     other = UOp(Ops.CUSTOM, src=(val,), arg=
@@ -107,6 +119,10 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if not isinstance(x.numel(), int):
+      # symbolic token count (a prefill chunk): pad to the static max so the matmul, with a fused ggml dequant, has a static shape the
+      # optimizer can tile for tensor cores (the contiguous keeps the shrink out of the matmul). symbolic, it ran ~8x slower on Apple GPUs
+      return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
@@ -779,7 +795,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
+                                metal:bool=False) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -802,8 +819,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   for row_idx,row in enumerate(rows):
     previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
     decayed, bv = tuple(x * alpha[bh, token, col if alpha_dim > 1 else 0].load() for x,col in zip(previous, cols)), beta[bh, token].load()
-    state_k = warp_reduce(sum((x*y for x,y in zip(decayed, keys)), UOp.const(0, dtypes.float32)), full_wave=True)
-    state_q = warp_reduce(sum((x*y for x,y in zip(decayed, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
+    state_k = warp_reduce(sum((x*y for x,y in zip(decayed, keys)), UOp.const(0, dtypes.float32)), full_wave=True, metal=metal)
+    state_q = warp_reduce(sum((x*y for x,y in zip(decayed, queries)), UOp.const(0, dtypes.float32)), full_wave=True, metal=metal)
     delta = (v[bh, token, row].load() - state_k) * bv
     updates += [x + delta*y for x,y in zip(decayed, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q + delta*kq[bh, token]))
@@ -827,5 +844,5 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
+  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound(), metal=is_metal(q.device)).call(*contig)
   return Tensor(contig[0].after(call))
