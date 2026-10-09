@@ -431,8 +431,8 @@ class GatedDeltaNetBlock(FFNBlock):
     for buf, val in ((self._verify_k, k), (self._verify_v, v), (self._verify_beta, beta), (self._verify_alpha, alpha),
                      (self._verify_conv_window, conv_window)):
       stores = buf.uop.after(stores).store(val.contiguous().uop)
-    z = (self.ssm_norm(core) * out_gate.silu()).cast(dtypes.half).contiguous()
-    return Tensor(self.ssm_out(z.reshape(B, N, -1)).contiguous().uop.after(stores)) # realizing the output fires the stashes
+    z = Tensor((self.ssm_norm(core) * out_gate.silu()).cast(dtypes.half).contiguous().uop.after(stores)) # the output fires the stashes
+    return self.ssm_out(z.reshape(B, N, -1))
 
   def commit_verify(self, accept:int) -> list[UOp]:
     """land the state after the accepted prefix (window positions 0..accept): rerun the fused scan on the real state with the rejected
