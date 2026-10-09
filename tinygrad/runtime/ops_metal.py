@@ -1,6 +1,6 @@
 from __future__ import annotations
 import subprocess, pathlib, struct, ctypes, tempfile, functools, platform, weakref, threading, array, sys
-from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup, to_tuple
+from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup, to_tuple, getenv
 import tinygrad.runtime.support.objc as objc
 from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, Compiler, CompileError, MMIOInterface
 from tinygrad.dtype import dtypes, AddrSpace
@@ -125,11 +125,38 @@ def mtl_run(icb:UOp, value:UOp, first:UOp|int, count:int, last:bool, q:MetalQueu
   if last: c = mtl_msg(cb.after(c), "encodeSignalEvent:value:", event, value)
   return mtl_msg(cb.after(c), "commit").sink()
 
+# Direct dispatch (METAL_DIRECT=1, the default): every kernel is encoded on a serial compute encoder instead of executed from an indirect
+# command buffer. On an M2 Pro (Apple8, macOS 27) register-heavy kernels compute wrong values when they run from an ICB; the same pipeline is
+# correct dispatched directly (extra/metal_icb_repro.py)
+METAL_DIRECT = getenv("METAL_DIRECT", 1)
+
+@uopfunc
+def mtl_run_direct(icb:UOp, value:UOp, q:MetalQueue) -> UOp:
+  cmds, hdr, devs, dev = q.cmds, round_up(q.nbytes, 8) + 24, q.devs, q.dev
+  cb, enc = [UOp.alloc((1,), dtypes.uint64, 0, device=devs[0]).rtag(t) for t in ("mtl_cb", "mtl_enc")]
+  fence, event = [mtl_handle(devs, h).index(0).load() for h in ("fence", "event")]
+  c = mtl_msg(mtl_handle(devs, "queue"), "commandBuffer", out=cb)
+  c = mtl_msg(cb.after(c), "computeCommandEncoder", out=enc) # serial: each dispatch sees the writes of the previous ones
+  c = mtl_msg(enc.after(c), "waitForFence:", fence)
+  if dev.residency.value is None:
+    c = mtl_msg(enc.after(c), "useResources:count:usage:", *[mtl_handle(devs, h).index(0).load() for h in ("resources", "count")], 3)
+  # one loop over the command table (pipeline index, args offset, args length, launch dims offset) that submit wrote after the args
+  words, r = icb.bitcast(dtypes.uint64), UOp.range(len(cmds), next(UOp.unique_num), dtype=dtypes.uint64)
+  ent = [words.index(q.table // 8 + 4 * r + j).load() for j in range(4)]
+  c = mtl_msg(enc.after(c), "setComputePipelineState:", words.index(hdr // 8 + 1 + len(cmds) + ent[0]).load())
+  c = mtl_msg(enc.after(c), "setBytes:length:atIndex:", icb.index(ent[1]), ent[2], 0)
+  c = mtl_msg(enc.after(c), "dispatchThreadgroups:threadsPerThreadgroup:", icb.index(ent[3]), icb.index(ent[3] + 24)).end(r)
+  c = mtl_msg(enc.after(c), "updateFence:", fence)
+  c = mtl_msg(enc.after(c), "endEncoding")
+  c = mtl_msg(cb.after(c), "encodeSignalEvent:value:", event, value)
+  return mtl_msg(cb.after(c), "commit").sink()
+
 class MetalQueue(HWQueue):
   dev:MetalDevice
   def __init__(self, submit:UOp):
     super().__init__(submit)
     self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[tuple](), list[tuple[int, int]](), list[UOp](), 0
+    self.direct = list[tuple[int, int, int]]() # per command: args offset, args length, launch dims offset (6 uint64)
 
   def exec(self, call:UOp, prg:UOp):
     bufs, vals, obj = get_call_arg_uops(call), get_call_var_uops(call, prg), prg.to_elf()
@@ -143,6 +170,13 @@ class MetalQueue(HWQueue):
       self.sizes.append((len(self.cmds), at:=round_up(self.nbytes, 8)))
       self.rows += layout_args([d.cast(dtypes.uint64) if isinstance(d, UOp) else UOp.const(d, dtypes.uint64) for d in dims], at)
       self.nbytes = at + 48
+    else: at = -1
+    if METAL_DIRECT:
+      args_len = self.nbytes - off if at < 0 else at - off
+      if at < 0: # static dims, stored next to the args for the direct dispatch
+        self.rows += layout_args([UOp.const(d, dtypes.uint64) for d in dims], at:=round_up(self.nbytes, 8))
+        self.nbytes = at + 48
+      self.direct.append((off, max(args_len, 8), at))
     self.cmds.append((obj.lib, obj.name, tuple(1 if isinstance(d, UOp) else int(d) for d in dims), off))
 
   def wait(self, dst:UOp, val:UOp, eq=False): pass # the fence orders the queue
@@ -150,6 +184,12 @@ class MetalQueue(HWQueue):
   def signal(self, dst:UOp, val:UOp): self.value = val
 
   def submit(self, cmdbuf:UOp) -> UOp:
+    if METAL_DIRECT and not self.stamps: # the command table for mtl_run_direct, before the header
+      pipes0 = dedup(c[:2] for c in self.cmds)
+      self.table = round_up(self.nbytes, 8)
+      vals = [v for i, cmd in enumerate(self.cmds) for v in (pipes0.index(cmd[:2]), *self.direct[i])]
+      self.rows += layout_args([UOp.const(v, dtypes.uint64) for v in vals], self.table)
+      self.nbytes = self.table + 8 * len(vals)
     n, zero, pipes = len(self.cmds), round_up(self.nbytes, 8), dedup(c[:2] for c in self.cmds)
     tag = (self.dev.tag("mtl_icb"), tuple(self.cmds), zero + 24)
     buf = UOp.alloc((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=self.devs[0]).rtag(tag).after(*self.deps)
@@ -161,7 +201,7 @@ class MetalQueue(HWQueue):
       icb = icb.after(mtl_msg(cmd, "concurrentDispatchThreadgroups:threadsPerThreadgroup:", icb.index(off), icb.index(off + 24)))
 
     # collect timestamps using cmdbuf metrics, so sep cmdbufs
-    if not self.stamps: return mtl_run(icb, self.value, 0, n, True, self)
+    if not self.stamps: return mtl_run_direct(icb, self.value, self) if METAL_DIRECT else mtl_run(icb, self.value, 0, n, True, self)
     slots, r = self.stamps[0].src[0], UOp.range(n - 1, next(UOp.unique_num), dtype=dtypes.uint64) # slots: [signal, timeline, [x, cb, x, end]...]
     if n > 1: icb = icb.after(mtl_run(icb.after(r), self.value, r, 1, False, self, slots.shrink(((4 + 4 * r, 8 + 4 * r),))).end(r))
     return mtl_run(icb, self.value, n - 1, 1, True, self, slots.shrink(((4 * n, 4 * n + 4),)))
