@@ -584,7 +584,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
   # exchange across the block's waves through LDS (fp16 halves LDS so more blocks fit per CU)
   # Matching cache/LDS strides can reuse a loop-local cache index outside the loop. Pad that layout.
-  acc_lds = UOp.alloc((WAVES, G, D + (LDS_PAD if G == SEC else 0)), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :, :D]
+  acc_lds = UOp.alloc((WAVES, G, D), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :, :D]
   ml_lds = UOp.alloc((WAVES, G, 2), dtypes.float, addrspace=AddrSpace.LOCAL)
   lds_acc = acc_lds.reshape(WAVES, G, WARP_SIZE, DPL)
   # Normalize before fp16 to avoid overflow. Nonempty waves have sum >= 1; empty waves keep their zero accumulator.
