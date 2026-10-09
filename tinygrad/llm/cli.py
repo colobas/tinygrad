@@ -141,6 +141,11 @@ class FallbackTemplate:
 
 from tinygrad.llm.serve import LLMServer
 
+def fetch_model(model:str):
+  # a preset name, a url or a local path. downloads keep their file name (downloads/models/<file>.gguf) instead of the url hash
+  url = models.get(model, model)
+  return fetch(url, name=url.split("?")[0].rsplit("/", 1)[-1], subdir="models") if url.startswith(("http://", "https://")) else fetch(url)
+
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
@@ -158,7 +163,7 @@ def main():
   # load the model
   st = time.perf_counter()
   with Context(DEBUG=max(DEBUG.value, 1 if args.serve else 0)):
-    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, shard=args.shard)
+    model, kv = Transformer.from_gguf(fetch_model(args.model), args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes()*args.shard for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"loaded model \"{model_name}\" at {sum(file_sizes)*1e-9/(time.perf_counter()-st):.2f} GB/s with {sum(file_sizes):,} bytes "
