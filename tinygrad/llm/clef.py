@@ -238,13 +238,13 @@ class Clef:
 def main():
   import argparse
   from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-  from tinygrad.helpers import fetch
+  from tinygrad.llm.cli import fetch_model
   parser = argparse.ArgumentParser(description="serve a Clef decision model on /v1/systemone")
   parser.add_argument("model", help="clef gguf path or url")
   parser.add_argument("--serve", type=int, default=8080, metavar="PORT")
   parser.add_argument("--max_context", type=int, default=16384)
   args = parser.parse_args()
-  clef = Clef(fetch(args.model) if args.model.startswith("http") else args.model, args.max_context)
+  clef = Clef(fetch_model(args.model), args.max_context)
   class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
       if self.path != "/v1/systemone": return self.send_error(404)
