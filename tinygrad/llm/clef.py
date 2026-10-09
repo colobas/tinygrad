@@ -211,6 +211,14 @@ class Clef:
       s += n
     return Tensor.cat(*outs, dim=0)
 
+  def warmup(self):
+    """compile before serving: two calls of each chunk jit capture it (a prompt of two full chunks and two tails), then a small request
+    compiles the decision head kernels (the head jit itself is per (P, Q, N, U) shape)"""
+    self.hidden_states([0] * (2*self.chunk + 2*self.tail - 1))
+    req = {"model": "warmup", "state": {"text": "warmup"}, "questions": {"q": {"type": "choice", "instructions": "pick one",
+           "criteria": {"a": "first", "b": "second"}}, "n": {"type": "noul", "instructions": "yes or no?"}}}
+    for _ in range(2): self.systemone(req)
+
   def output_rows(self, token_ids:list[int]) -> dict[int, Tensor]:
     ids = sorted(set(token_ids))
     rows = Tensor.stack(*[self.out_raw[i] for i in ids]).reshape(-1)  # int-indexed rows are views of the packed bytes
@@ -243,8 +251,10 @@ def main():
   parser.add_argument("model", help="clef gguf path or url")
   parser.add_argument("--serve", type=int, default=8080, metavar="PORT")
   parser.add_argument("--max_context", type=int, default=16384)
+  parser.add_argument("--no_warmup", action="store_true", help="skip compiling before serving (the first requests compile instead)")
   args = parser.parse_args()
   clef = Clef(fetch_model(args.model), args.max_context)
+  if not args.no_warmup: clef.warmup()
   class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
       if self.path != "/v1/systemone": return self.send_error(404)
