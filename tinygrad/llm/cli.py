@@ -99,6 +99,8 @@ models = {
   "bonsai2:27b-ptq1": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
   # PrismML 1-bit Bonsai 27B (Q1_0, no Hadamard rotation), abliterated by dealignai
   "bonsai:27b-1bit-uncensored": "https://huggingface.co/dealignai/Bonsai-27b-1bit-CRACK-GGUF/resolve/main/Bonsai-27b-1bit-CRACK-Q1_0.gguf",
+  # Bonsai 2 27B abliterated v2 (PQ2_0) with the MTP head: use with --mtp 2 (drafts accept ~0.5 on prose, more on code)
+  "bonsai2:27b-mtp": "https://huggingface.co/BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP-GGUF/resolve/main/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP.gguf",
   "qwen3.6:27b": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
   # ships with the trailing MTP block (nextn_predict_layers): --mtp K speculative-decodes with it
   "qwen3.8:27b-uncensored": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf",
