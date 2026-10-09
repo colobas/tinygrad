@@ -757,15 +757,16 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   decode = resolve(T_real == 1, False)
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
   supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
-    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
+    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and
+    (q.max_shape[2] % BLOCK_M == 0 or isinstance(T_real, int) and T_real < BLOCK_M))
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
-  if isinstance(T_real, UOp):
-    # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
-    T_pad = q.max_shape[2]
+  if isinstance(T_real, UOp) or T_real % BLOCK_M:
+    # symbolic chunk or a short static window (the MTP verify): pad the queries to the static tile; garbage rows are sliced off
+    T_pad = q.max_shape[2] if isinstance(T_real, UOp) else BLOCK_M
     assert T_pad % BLOCK_M == 0, "chunk_size must be a multiple of 32"
     q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
   B, H, T, D = q.shape
