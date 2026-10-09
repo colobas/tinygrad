@@ -4,7 +4,8 @@ from typing import cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.helpers import DEBUG
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, clear_activation_memos, \
+  gated_delta_kernel_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, ggml_data_to_tensor
 from tinygrad.uop.ops import resolve, Ops, KernelInfo
 
@@ -12,6 +13,8 @@ def _embedding_rows_kernel(out:UOp, table:UOp, idx:UOp) -> UOp:
   # gather the packed rows of a quantized embedding table: only the looked up rows get dequantized, never the whole table
   t, j = UOp.range(out.shape[0], 0), UOp.range(out.shape[1], 1)
   return out[t, j].store(table[idx[t].load().cast(dtypes.weakint), j].load()).end(t, j).sink(arg=KernelInfo(name="embedding_rows", opts_to_apply=()))
+
+PREFILL_TAIL = 128 # max tokens per call of the prefill tail jit (Apple GPUs: 32-token calls ran at ~35 tok/s, 128 at ~95)
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -387,7 +390,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and gated_delta_kernel_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
@@ -497,6 +500,9 @@ class Transformer:
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
+    # a prefill chunk's matmuls run at its static max size: a prompt's last partial chunk goes through a smaller tail jit instead of paying
+    # for a whole padded chunk (when the chunk is bigger than PREFILL_TAIL)
+    self.prefill_tail_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
     # MTP speculative decoding: one jit per draft step and one for the verify window (generate_mtp)
     self.mtp_heads:list[MTPHead] = [MTPHead(config) for _ in range(config.num_mtp_heads)]
@@ -676,6 +682,11 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    if self.prefill_chunk > PREFILL_TAIL: # the full-chunk prefill jit too (a 1-token prompt only reaches the tail jit)
+      for _ in range(2):
+        self._cached_tokens = []
+        list(zip(range(1), self.generate([0]*self.prefill_chunk)))
+      self._cached_tokens = []
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -687,9 +698,9 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
     if chunk_size is None: chunk_size = self.prefill_chunk
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
+    v_toks, v_tail = UOp.variable("toks", 1, chunk_size), UOp.variable("tail_toks", 1, min(chunk_size, PREFILL_TAIL))
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
@@ -698,9 +709,12 @@ class Transformer:
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      remaining = len(tokens) - start_pos
+      tail = start_pos < prompt_len and remaining < chunk_size and chunk_size > PREFILL_TAIL
+      n_toks = min(PREFILL_TAIL if tail else chunk_size, remaining)
+      sp, nt = v_start_pos.bind(start_pos), (v_tail if tail else v_toks).bind(n_toks)
+      if tail: out = self.prefill_tail_jit(t[:, sp:sp+nt].contiguous(), sp, temp).realize()
+      else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
