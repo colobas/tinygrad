@@ -419,10 +419,10 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, rdna4:bool=False) -> UOp:
-  token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
-    out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
-    32 if out.shape[0] % 32 == 0 else 16
-  output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1 if out_features < 8192 else 2
+  # 64 tokens x 2 output tiles per wave was fastest for every Clef/Qwen3.6-27B shape at 256-1024 tokens (5120->1024..17408, 17408->5120):
+  # 128-token tiles ran 25-40% slower. small outputs on short chunks keep one output tile for more workgroups
+  token_tile = next(t for t in (64, 32, 16) if out.shape[0] % t == 0)
+  output_tiles = 1 if out_features <= 1024 and out.shape[0] <= 256 else 2
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
   output_waves, _, _, lane, wave, half, _, _, _ = layout
   word_indices = (half, half+2) if rdna4 else tuple(range(4))
