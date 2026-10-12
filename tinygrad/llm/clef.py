@@ -150,7 +150,8 @@ class JointSchemaHead:
     opts, rf = self._ln(routed, "decision.option_norm"), owner_oh @ fields
     cosine = (rf * opts).sum(-1) / (rf.square().sum(-1).sqrt().maximum(1e-8) * opts.square().sum(-1).sqrt().maximum(1e-8))
     feats = Tensor.cat(rf, opts, rf * opts, (rf - opts).abs(), dim=-1)
-    residual = (_gelu(self._lin(feats, "decision.scorer")) @ w["decision.scorer_out.weight"]) + w["decision.scorer_out.bias"]
+    # contiguous: fused with the scorer_out reduce the 4096->1024 matmul ran as one workgroup per option (47ms)
+    residual = (_gelu(self._lin(feats, "decision.scorer").contiguous()) @ w["decision.scorer_out.weight"]) + w["decision.scorer_out.bias"]
     return prior + self.gate * (self.joint_scale * cosine + residual)
 
   def __call__(self, hidden:Tensor, n_tokens:int, output_rows:dict[int, Tensor], rec:EncodedRecord) -> list[list[float]]:
