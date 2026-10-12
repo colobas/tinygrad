@@ -14,7 +14,8 @@ def kernel_source(log:str, name:str) -> str:
   i = log.find(name + "(")
   if i < 0: raise RuntimeError(f"kernel {name} not in the log")
   start = log.rfind("typedef long unsigned int size_t;", 0, i)  # the HIP renderer's preamble starts every program
-  return log[start:log.find("\n}\n", i) + 3]
+  # the program ends at its first line starting with "}": a progress bar ("compiling ...") can be printed right after the brace
+  return log[start:log.find("\n}", i)] + "\n}\n"
 
 if __name__ == "__main__":
   ap = argparse.ArgumentParser()

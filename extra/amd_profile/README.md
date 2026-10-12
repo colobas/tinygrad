@@ -73,7 +73,13 @@ Things to know about this hardware:
 
 ## Leads
 
-- Issue the activation loads before the next step's weight prefetch. `disasm.py --order` on the kernel above shows a
-  `s_waitcnt vmcnt(0)` before almost every WMMA. Each wait for the activation fragments also waits for the prefetched weights.
+- The activation loads of the LDS kernel are issued in pairs just before their WMMA, each pair followed by `s_waitcnt vmcnt(0)`
+  (`disasm.py --order`). The tinygrad source already has all 64 activation loads at the top of the loop body: LLVM's AMDGPU
+  scheduler moves each one down to its use. These did not change that schedule:
+  - an order dependency of the weight prefetch on the activation loads,
+  - `amdgpu_waves_per_eu(1, N)` with N from 1 to 4,
+  - `__builtin_amdgcn_sched_group_barrier` groups (all VMEM reads then the WMMAs, or interleaved) in the loop body.
+
+  Next steps: compiler options (`-mllvm -amdgpu-schedule-*`), or an inline-asm boundary that keeps the loads in place.
 - Prefetch the activation fragments of the next K step in registers: tried and no gain. All 16 fragments (128 VGPRs) spilled.
   One or two K slices fit (the kernel uses 119 VGPRs) but ran 2-5% slower.
