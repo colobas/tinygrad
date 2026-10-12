@@ -218,13 +218,15 @@ class AMDComputeQueue(HWQueue):
     for name in self.dev.pmc_names:
       block, idx = self.dev.pmc_counters[name]
       # sq block on gfx11+ goes down to wgps
-      inst_cnt, se_cnt, sa_cnt, wgp_cnt = {"GRBM": (1, 1, 1, 1), "GL2C": (32, 1, 1, 1), "TCC": (16, 1, 1, 1),
-        "SQ": (1, self.dev.se_cnt) + ((1, 1) if gfx9 else (2, self.dev.iface.props['cu_per_simd_array'] // 2))}[block]
+      # per-CU blocks (texture address/data, vector L0) have one instance per CU of every shader array
+      per_cu = (self.dev.iface.props['cu_per_simd_array'], self.dev.se_cnt, 1 if gfx9 else 2, 1)
+      inst_cnt, se_cnt, sa_cnt, wgp_cnt = {"GRBM": (1, 1, 1, 1), "GL2C": (32, 1, 1, 1), "TCC": (16, 1, 1, 1), "TA": per_cu, "TD": per_cu,
+        "TCP": per_cu, "SQ": (1, self.dev.se_cnt) + ((1, 1) if gfx9 else (2, self.dev.iface.props['cu_per_simd_array'] // 2))}[block]
       end_off += (rec_size:=prod((self.dev.xccs, inst_cnt, se_cnt, sa_cnt, wgp_cnt)) * 8)
 
       # gfx11+ and later require even-numbered SQ *_SELECT registers
       regsample = f'reg{block}_PERFCOUNTER{(pcid:=next(block2pid[block]))}'
-      if (regsel:=getattr(self.gc, (f'reg{block}_PERFCOUNTER{(pcid*2) if not gfx9 and block=="SQ" else pcid}_SELECT'), None)) is None:
+      if (regsel:=self._pmc_reg(f'reg{block}_PERFCOUNTER{(pcid*2) if not gfx9 and block=="SQ" else pcid}_SELECT')) is None:
         raise RuntimeError(f'{block} is out of perfcounter registers: ({regsample} is not found)')
 
       self.wreg(regsel, perf_sel=idx, **({'simd_mask':0xf, 'sqc_bank_mask':0xf, 'sqc_client_mask':0xf} if gfx9 and block == "SQ" else {}))
@@ -234,6 +236,14 @@ class AMDComputeQueue(HWQueue):
     if gfx9: self.wreg(self.gc.regSQ_PERFCOUNTER_MASK, sh0_mask=0xffff, sh1_mask=0xffff)
     self.wreg(self.gc.regCOMPUTE_PERFCOUNT_ENABLE, 1)
     self.pmc_reset_counters(en=True)
+
+  def _pmc_reg(self, name:str) -> AMDReg|None:
+    # the curated gc register tables lack the per-CU (TA/TD/TCP) perfcounters on gfx11: take their offsets from the full gfx11 header
+    if (reg:=getattr(self.gc, name, None)) is not None or self.target[0] != 11: return reg
+    from tinygrad.runtime.autogen import amd_gpu
+    if (off:=getattr(amd_gpu, name, None)) is None: return None
+    fields = {'perf_sel': (0, 9)} if name.endswith('_SELECT') else {'perfcounter_' + name.split('_')[-1].lower(): (0, 31)}
+    return AMDReg(name=name, offset=off, segment=getattr(amd_gpu, name+'_BASE_IDX'), fields=fields, bases=self.gc.bases)
 
   def pmc_read(self, slot:UOp):
     buf = self.prof_buf("pmc_buf", dtypes.uint8).getaddr(self.devs) + slot * self.dev.pmc_size
@@ -248,10 +258,12 @@ class AMDComputeQueue(HWQueue):
           for inst, se_idx, sa_idx, wgp_idx in itertools.product(range(smp.inst), range(smp.se), range(smp.sa), range(smp.wgp)):
             loff = next(offset)
             if smp.wgp > 1 and not self.dev.iface.is_wgp_active(xcc, se_idx, sa_idx, wgp_idx): continue
-            self.set_grbm(**({'instance':inst} if smp.inst > 1 else ({'se':se_idx}|({'sh':sa_idx, 'wgp':wgp_idx} if self.target[0] != 9 else {}))))
+            if smp.block in ("TA", "TD", "TCP"): self.set_grbm(instance=inst, se=se_idx, sh=sa_idx)
+            else:
+              self.set_grbm(**({'instance':inst} if smp.inst > 1 else ({'se':se_idx}|({'sh':sa_idx, 'wgp':wgp_idx} if self.target[0] != 9 else {}))))
 
             # Copy counter to memory (src_sel = perf, dst_sel = tc_l2)
-            lo, hi = getattr(self.gc, f'{smp.regsample}_LO'), getattr(self.gc, f'{smp.regsample}_HI', None)
+            lo, hi = cast(AMDReg, self._pmc_reg(f'{smp.regsample}_LO')), self._pmc_reg(f'{smp.regsample}_HI')
             self.pkt3(self.pm4.PACKET3_COPY_DATA, (2 << 8) | 4, lo.addr[0], 0, buf + loff)
             if hi is not None: self.pkt3(self.pm4.PACKET3_COPY_DATA, (2 << 8) | 4, hi.addr[0], 0, buf + (loff + 4))
 
