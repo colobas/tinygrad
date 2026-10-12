@@ -471,27 +471,25 @@ def _iq4_linear_lds_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, i
   accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(4)] for _ in range(2)]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
   nsteps = in_features // IQ4_KS
-  # thread t copies 32 activation halves of row t//2, and dequantizes half t%2 of both subblocks of the K step of output row t//2
-  orow, hp, arow, acol = tid // 2, tid % 2, tid // 2, (tid % 2)*32
-  def fetch(step:UOp) -> tuple[list[UOp], list[UOp]]: # the global loads of a K step: activation halves, per subblock the header + 4 qs words
+  # thread t copies 32 activation halves of row t//2, and dequantizes subblock t%2 of the K step of output row t//2: its header (2 words) and
+  # its 4 contiguous qs words. a LUT pair holds the weights of a code byte in both 16-weight halves of the subblock
+  orow, si, arow, acol = tid // 2, tid % 2, tid // 2, (tid % 2)*32
+  def fetch(step:UOp) -> tuple[list[UOp], list[UOp]]: # the global loads of a K step: activation halves, header + 4 qs words
     acts = [x[tok_block*IQ4_TM + arow, step*IQ4_KS + acol + j].load() for j in range(32)]
-    words = []
-    for si in range(ns):
-      sg = step*ns + si
-      base = ((out_block*IQ4_TN + orow)*nblocks + sg // 8)*bw
-      words += [raw[base].load(), raw[base + 1].load()] + [raw[base + 2 + (sg % 8)*4 + w].load() for w in range(4)]
-    return acts, words
+    base = ((out_block*IQ4_TN + orow)*nblocks + step // (8 // ns))*bw  # a 256-weight block spans 8//ns K steps
+    sub = (step % (8 // ns))*ns + si
+    return acts, [raw[base].load(), raw[base + 1].load()] + [raw[base + 2 + sub*4 + w].load() for w in range(4)]
   def place(step:UOp, fetched:tuple[list[UOp], list[UOp]]) -> list[tuple[UOp, UOp]]: # (LDS element, value): the dequant of a K step
-    acts, words = fetched
+    acts, (header, low, *qs) = fetched
+    sub = (step % (8 // ns))*ns + si
+    sc = ((low >> (4*sub).cast(dtypes.uint32)) & 15) | (((header >> (16+2*sub).cast(dtypes.uint32)) & 3) << 4)
+    scale = _half(header) * (sc.cast(dtypes.int32)-32).float()
     vals = [(a_lds[arow, acol + j], acts[j]) for j in range(32)]
-    for si in range(ns):
-      header, low, qs, sub = words[si*6], words[si*6 + 1], words[si*6 + 2:si*6 + 6], (step*ns + si) % 8
-      sc = ((low >> (4*sub).cast(dtypes.uint32)) & 15) | (((header >> (16+2*sub).cast(dtypes.uint32)) & 3) << 4)
-      scale = _half(header) * (sc.cast(dtypes.int32)-32).float()
-      for w in range(4):
-        for byte in range(4):
-          pair = lut_l[((qs[w] >> (byte*8)) & 255).cast(dtypes.weakint)]
-          vals.append((b_lds[orow, si*32 + hp*16 + w*4 + byte], (_half((pair >> (hp*16)) & 0xffff)*scale).cast(dtypes.float16)))
+    for w in range(4):
+      for byte in range(4):
+        pair = lut_l[((qs[w] >> (byte*8)) & 255).cast(dtypes.weakint)]
+        for h in range(2):
+          vals.append((b_lds[orow, si*32 + h*16 + w*4 + byte], (_half((pair >> (h*16)) & 0xffff)*scale).cast(dtypes.float16)))
     return vals
   zero = UOp.const(0, dtypes.weakint)
   pro = UOp.barrier(UOp.group(*(e.store(v) for e, v in place(zero, fetch(zero)))))
