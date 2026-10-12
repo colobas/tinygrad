@@ -455,9 +455,10 @@ IQ4_TM, IQ4_TN, IQ4_KS = 128, 128, 64
 
 @functools.cache
 def _iq4_linear_lds_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, rdna4:bool=False) -> UOp:
-  # the per-wave kernel's time went to its memory path (PMC: 82% TA busy, waves waiting 83% of their cycles): every 32-output wave reloaded
-  # the activations of its 64 tokens and dequantized its weights in both half-waves. here a K step stages the activation tile and the
-  # dequantized weight tile in LDS once per workgroup, and the next step's global loads are issued before this step's WMMAs
+  # the per-wave kernel's time went to its memory path (PMC: 82% TA busy, waves waiting 83% of their cycles): its 32-output waves loaded and
+  # dequantized their weights from 16 scattered rows, in both half-waves. here a K step stages the dequantized weight tile in LDS once per
+  # workgroup, and the next step's weight loads are issued before this step's WMMAs. the activation fragments are read from global memory:
+  # staged in LDS too, the fragment reads made the kernel LDS-bandwidth bound
   T, nwaves = cast(int, out.shape[0]), 8
   x = x.reshape(T, in_features)
   tok_block, out_block = UOp.range(T//IQ4_TM, 0), UOp.range(out_features//IQ4_TN, 1)
@@ -466,25 +467,23 @@ def _iq4_linear_lds_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, i
   tid, nblocks, bw, ns = wave*WARP_SIZE + lane, in_features // 256, QUANT_SIZES[IQ4_XS] // 4, IQ4_KS // 32
   local_lut = UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
   lut_l = local_lut.after(UOp.barrier(local_lut[tid].store(lut[tid])))
-  a_lds = UOp.alloc((IQ4_TM, IQ4_KS + 8), dtypes.half, addrspace=AddrSpace.LOCAL)
   b_lds = UOp.alloc((IQ4_TN, IQ4_KS + 8), dtypes.half, addrspace=AddrSpace.LOCAL)
   accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(4)] for _ in range(2)]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
   nsteps = in_features // IQ4_KS
-  # thread t copies 32 activation halves of row t//2, and dequantizes subblock t%2 of the K step of output row t//2: its header (2 words) and
-  # its 4 contiguous qs words. a LUT pair holds the weights of a code byte in both 16-weight halves of the subblock
-  orow, si, arow, acol = tid // 2, tid % 2, tid // 2, (tid % 2)*32
-  def fetch(step:UOp) -> tuple[list[UOp], list[UOp]]: # the global loads of a K step: activation halves, header + 4 qs words
-    acts = [x[tok_block*IQ4_TM + arow, step*IQ4_KS + acol + j].load() for j in range(32)]
+  # thread t dequantizes subblock t%2 of the K step of output row t//2: its header (2 words) and its 4 contiguous qs words. a LUT pair holds
+  # the weights of a code byte in both 16-weight halves of the subblock
+  orow, si = tid // 2, tid % 2
+  def fetch(step:UOp) -> list[UOp]: # the weight loads of a K step: header + 4 qs words
     base = ((out_block*IQ4_TN + orow)*nblocks + step // (8 // ns))*bw  # a 256-weight block spans 8//ns K steps
     sub = (step % (8 // ns))*ns + si
-    return acts, [raw[base].load(), raw[base + 1].load()] + [raw[base + 2 + sub*4 + w].load() for w in range(4)]
-  def place(step:UOp, fetched:tuple[list[UOp], list[UOp]]) -> list[tuple[UOp, UOp]]: # (LDS element, value): the dequant of a K step
-    acts, (header, low, *qs) = fetched
+    return [raw[base].load(), raw[base + 1].load()] + [raw[base + 2 + sub*4 + w].load() for w in range(4)]
+  def place(step:UOp, fetched:list[UOp]) -> list[tuple[UOp, UOp]]: # (LDS element, value): the dequant of a K step
+    header, low, *qs = fetched
     sub = (step % (8 // ns))*ns + si
     sc = ((low >> (4*sub).cast(dtypes.uint32)) & 15) | (((header >> (16+2*sub).cast(dtypes.uint32)) & 3) << 4)
     scale = _half(header) * (sc.cast(dtypes.int32)-32).float()
-    vals = [(a_lds[arow, acol + j], acts[j]) for j in range(32)]
+    vals = []
     for w in range(4):
       for byte in range(4):
         pair = lut_l[((qs[w] >> (byte*8)) & 255).cast(dtypes.weakint)]
@@ -493,14 +492,14 @@ def _iq4_linear_lds_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, i
     return vals
   zero = UOp.const(0, dtypes.weakint)
   pro = UOp.barrier(UOp.group(*(e.store(v) for e, v in place(zero, fetch(zero)))))
-  a_base, b_base = a_lds.after(pro), b_lds.after(pro)
+  b_base = b_lds.after(pro)
   g = UOp.range(nsteps, 4, AxisType.LOOP)
   gn = (g + 1).minimum(nsteps - 1)  # the last step refetches itself, harmless
   fetched = fetch(gn)  # only the loads before the WMMAs: the dequant (LUT reads) would wait for them
-  a_t, b_t = a_base.after(g), b_base.after(g)
+  b_t = b_base.after(g)
   cur = [[accs[o][t].after(g) for t in range(4)] for o in range(2)]
   for kk in range(IQ4_KS // 16):
-    afr = [a_t[wm*64 + t*16 + col, kk*16:kk*16+16] for t in range(4)]
+    afr = [UOp.stack(*(x[tok_block*IQ4_TM + wm*64 + t*16 + col, g*IQ4_KS + kk*16 + i] for i in range(16))) for t in range(4)]
     bfr = [b_t[wn*32 + o*16 + col, kk*16:kk*16+16] for o in range(2)]
     cur = [[UOp.wmma(afr[t], bfr[o], cur[o][t], *WMMA_ARG) for t in range(4)] for o in range(2)]
   done = UOp.group(*(accs[o][t].store(cur[o][t]) for o in range(2) for t in range(4))).barrier()
