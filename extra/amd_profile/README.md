@@ -75,5 +75,5 @@ Things to know about this hardware:
 
 - Issue the activation loads before the next step's weight prefetch. `disasm.py --order` on the kernel above shows a
   `s_waitcnt vmcnt(0)` before almost every WMMA. Each wait for the activation fragments also waits for the prefetched weights.
-- Prefetch the activation fragments of the next K slice. The current kernel uses 119 VGPRs (247 while the activations were staged in
-  LDS), so it has the room.
+- Prefetch the activation fragments of the next K step in registers: tried and no gain. All 16 fragments (128 VGPRs) spilled.
+  One or two K slices fit (the kernel uses 119 VGPRs) but ran 2-5% slower.
