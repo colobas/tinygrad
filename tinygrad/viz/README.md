@@ -91,3 +91,21 @@ Get bank conflicts:
 ```bash
 python -m tinygrad.viz.cli -s "gemm PMC" | rg -A 16 SQC_LDS_BANK_CONFLICT
 ```
+
+Choose the counters with `PMC_COUNTERS=A,B,...`. An unknown name prints the list of available counters.
+The first line of a counter is its total. The next lines are per shader engine, shader array and WGP (SQ) or CU (TA, TD, TCP).
+
+### PMC through TinyGPU (macOS)
+
+Use these settings:
+```bash
+PMC=1 SQTT=0 SQTT_BUFFER_SIZE=64 PROF_SLOTS=8 PMC_COUNTERS=... VIZ=-1 DEV=AMD python script.py
+```
+
+- The SQTT buffer is allocated even with `SQTT=0`. The default size (256MB per shader engine) does not map through TinyGPU.
+- With a very small buffer, a large kernel overflows it and the readback hangs the GPU.
+- Only the last `PROF_SLOTS` kernels are kept, so run the kernel of interest last.
+
+`extra/amd_profile/pmc.py` runs a script with these settings and prints the totals of one kernel.
+`extra/amd_profile/disasm.py` shows the register, LDS and instruction usage of a kernel from a `DEBUG=4` log.
+See `extra/amd_profile/README.md` for the usage and a worked example.
