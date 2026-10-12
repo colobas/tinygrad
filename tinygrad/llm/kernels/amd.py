@@ -357,13 +357,26 @@ def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   tokens = tuple(tuple(token_block*token_tile + tile*16 + half*8 + i for i in range(8)) for tile in range(token_tile//16))
   return output_waves, token_block, output_block, lane, wave, half, outputs, inputs, tokens
 
-def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves, rdna4):
+def _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, output_waves, rdna4, permlane=False):
   # RDNA4 owns eight consecutive rows per half-wave, matching tokens directly.
   if rdna4:
     return [out[token, output].store(acc.after(update)[i].load()) for output,output_accs in zip(outputs, accs)
             for tile_tokens,acc in zip(tokens, output_accs) for i,token in enumerate(tile_tokens)]
-  # the accumulator fragment halves are exchanged between lane pairs (l, l^16) through LDS (a ds_swizzle without CUSTOM)
   flat_accs = [acc for output_accs in accs for acc in output_accs]
+  if permlane:
+    # v_permlanex16 with identity selects reads lane l^16 (fetch inactive: the stores below may run under a partial exec mask)
+    def peer_of(v:UOp) -> UOp:
+      return UOp(Ops.CUSTOMI, src=(v.bitcast(dtypes.uint32),), arg=("__builtin_amdgcn_permlanex16({0}, {0}, 0x76543210u, 0xfedcba98u, true, false)",
+                                                                   dtypes.uint32)).bitcast(dtypes.float32)
+    def pvalues(ai:int) -> tuple[UOp, ...]:
+      own = tuple(flat_accs[ai].after(update)[i].load() for i in range(8))
+      peer = tuple(peer_of(v) for v in own)
+      low = half.eq(0)
+      return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
+    tt = len(tokens)
+    return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
+            for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, pvalues(ot*tt+tile))]
+  # the accumulator fragment halves are exchanged between lane pairs (l, l^16) through LDS (a ds_swizzle without CUSTOM)
   lds = UOp.alloc((output_waves, 32, len(flat_accs)*8), dtypes.float32, addrspace=AddrSpace.LOCAL)
   stores = [lds[wave, lane, a*8+i].store(acc.after(update)[i].load()) for a,acc in enumerate(flat_accs) for i in range(8)]
   lds = lds.after(*stores)
@@ -437,6 +450,69 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
     return tuple((_half((pair >> (half*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in pairs)
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[IQ4_XS]//4, layout, dequant, "linear_iq4_xs_f16_wmma", rdna4)
 
+# LDS-tiled IQ4_XS prefill: a workgroup of 2x4 waves (64 tokens x 32 outputs each) computes 128 tokens x 128 outputs, K in steps of 64
+IQ4_TM, IQ4_TN, IQ4_KS = 128, 128, 64
+
+@functools.cache
+def _iq4_linear_lds_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, rdna4:bool=False) -> UOp:
+  # the per-wave kernel's time went to its memory path (PMC: 82% TA busy, waves waiting 83% of their cycles): every 32-output wave reloaded
+  # the activations of its 64 tokens and dequantized its weights in both half-waves. here a K step stages the activation tile and the
+  # dequantized weight tile in LDS once per workgroup, and the next step's global loads are issued before this step's WMMAs
+  T, nwaves = cast(int, out.shape[0]), 8
+  x = x.reshape(T, in_features)
+  tok_block, out_block = UOp.range(T//IQ4_TM, 0), UOp.range(out_features//IQ4_TN, 1)
+  lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(nwaves, 3, axis_type=AxisType.LOCAL)
+  wm, wn, col, half = wave // 4, wave % 4, lane % 16, lane // 16
+  tid, nblocks, bw, ns = wave*WARP_SIZE + lane, in_features // 256, QUANT_SIZES[IQ4_XS] // 4, IQ4_KS // 32
+  local_lut = UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  lut_l = local_lut.after(UOp.barrier(local_lut[tid].store(lut[tid])))
+  a_lds = UOp.alloc((IQ4_TM, IQ4_KS + 8), dtypes.half, addrspace=AddrSpace.LOCAL)
+  b_lds = UOp.alloc((IQ4_TN, IQ4_KS + 8), dtypes.half, addrspace=AddrSpace.LOCAL)
+  accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(4)] for _ in range(2)]
+  accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
+  nsteps = in_features // IQ4_KS
+  # thread t copies 32 activation halves of row t//2, and dequantizes half t%2 of both subblocks of the K step of output row t//2
+  orow, hp, arow, acol = tid // 2, tid % 2, tid // 2, (tid % 2)*32
+  def fetch(step:UOp) -> tuple[list[UOp], list[UOp]]: # the global loads of a K step: activation halves, per subblock the header + 4 qs words
+    acts = [x[tok_block*IQ4_TM + arow, step*IQ4_KS + acol + j].load() for j in range(32)]
+    words = []
+    for si in range(ns):
+      sg = step*ns + si
+      base = ((out_block*IQ4_TN + orow)*nblocks + sg // 8)*bw
+      words += [raw[base].load(), raw[base + 1].load()] + [raw[base + 2 + (sg % 8)*4 + w].load() for w in range(4)]
+    return acts, words
+  def place(step:UOp, fetched:tuple[list[UOp], list[UOp]]) -> list[tuple[UOp, UOp]]: # (LDS element, value): the dequant of a K step
+    acts, words = fetched
+    vals = [(a_lds[arow, acol + j], acts[j]) for j in range(32)]
+    for si in range(ns):
+      header, low, qs, sub = words[si*6], words[si*6 + 1], words[si*6 + 2:si*6 + 6], (step*ns + si) % 8
+      sc = ((low >> (4*sub).cast(dtypes.uint32)) & 15) | (((header >> (16+2*sub).cast(dtypes.uint32)) & 3) << 4)
+      scale = _half(header) * (sc.cast(dtypes.int32)-32).float()
+      for w in range(4):
+        for byte in range(4):
+          pair = lut_l[((qs[w] >> (byte*8)) & 255).cast(dtypes.weakint)]
+          vals.append((b_lds[orow, si*32 + hp*16 + w*4 + byte], (_half((pair >> (hp*16)) & 0xffff)*scale).cast(dtypes.float16)))
+    return vals
+  zero = UOp.const(0, dtypes.weakint)
+  pro = UOp.barrier(UOp.group(*(e.store(v) for e, v in place(zero, fetch(zero)))))
+  a_base, b_base = a_lds.after(pro), b_lds.after(pro)
+  g = UOp.range(nsteps, 4, AxisType.LOOP)
+  gn = (g + 1).minimum(nsteps - 1)  # the last step refetches itself, harmless
+  fetched = fetch(gn)  # only the loads before the WMMAs: the dequant (LUT reads) would wait for them
+  a_t, b_t = a_base.after(g), b_base.after(g)
+  cur = [[accs[o][t].after(g) for t in range(4)] for o in range(2)]
+  for kk in range(IQ4_KS // 16):
+    afr = [a_t[wm*64 + t*16 + col, kk*16:kk*16+16] for t in range(4)]
+    bfr = [b_t[wn*32 + o*16 + col, kk*16:kk*16+16] for o in range(2)]
+    cur = [[UOp.wmma(afr[t], bfr[o], cur[o][t], *WMMA_ARG) for t in range(4)] for o in range(2)]
+  done = UOp.group(*(accs[o][t].store(cur[o][t]) for o in range(2) for t in range(4))).barrier()
+  update = UOp.barrier(UOp.group(done, *(e.src[0].after(done).index(*e.src[1:]).store(v) for e, v in place(gn, fetched)))).end(g)
+  outputs = tuple(out_block*IQ4_TN + wn*32 + o*16 + col for o in range(2))
+  tokens = tuple(tuple(tok_block*IQ4_TM + wm*64 + t*16 + half*8 + i for i in range(8)) for t in range(4))
+  # the 8-wave LDS exchange of the accumulator halves would need 64KB on top of the tiles: exchange them across lanes instead
+  st = _wmma_stores(out, outputs, tokens, accs, update, half, lane, wave, nwaves, False, permlane=True)
+  return UOp.group(*st).end(tok_block, out_block, lane, wave).sink(arg=KernelInfo(name="linear_iq4_xs_lds_wmma", opts_to_apply=()))
+
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   out_features:int, in_features:int, ggml_type:int, rdna4:bool=False) -> UOp:
@@ -487,7 +563,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   # the kernels write the output features of their own device
   local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis == 0 else out_features
   if tokens % 16 == 0 and local_out % 16 == 0:
-    if layer.ggml_type == IQ4_XS:
+    if layer.ggml_type == IQ4_XS and tokens % IQ4_TM == 0 and local_out % IQ4_TN == 0 and local_out >= 4096 and in_features % IQ4_KS == 0 \
+       and not _wmma_rdna4(x.device):
+      fxn, extra = _iq4_linear_lds_kernel, (iq4_half_lut(x.device),)
+    elif layer.ggml_type == IQ4_XS:
       fxn, extra = _iq4_linear_f16_wmma_kernel, (iq4_half_lut(x.device),)
     else:
       fxn = functools.partial(_q5_linear_f16_wmma_kernel if layer.ggml_type in (Q4_K, Q5_K) else _quant_linear_f16_wmma_kernel,
