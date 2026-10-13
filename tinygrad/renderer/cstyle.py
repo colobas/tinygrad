@@ -535,7 +535,9 @@ class HIPRenderer(CStyleLanguage):
 
   # https://clang.llvm.org/docs/AttributeReference.html#amdgpu-flat-work-group-size
   # NOTE: this makes hlb_cifar10 twice as fast, there may be more gains in tweaking these parameters
-  kernel_typedef = 'extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1, {launch_bounds})))'
+  # AMD_WAVES_PER_EU=min[,max]: the occupancy the AMDGPU scheduler plans the registers for (see extra/amd_profile/README.md)
+  kernel_typedef = 'extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1, {launch_bounds})))' + \
+    (f' __attribute__((amdgpu_waves_per_eu({getenv("AMD_WAVES_PER_EU", "")})))' if getenv("AMD_WAVES_PER_EU", "") else "")
   code_for_workitem = {"g": lambda x: f"__ockl_get_group_id({x})", "l": lambda x: f"__ockl_get_local_id({x})"}
   code_for_op = {**CStyleLanguage.code_for_op, Ops.TRUNC: _ocml("trunc"), Ops.SIN: _ocml("sin"),
                  Ops.LOG2: _ocml("log2"), Ops.EXP2: _ocml("exp2"), Ops.SQRT: _ocml("sqrt")}

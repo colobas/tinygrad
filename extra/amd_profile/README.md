@@ -80,6 +80,15 @@ Things to know about this hardware:
   - `amdgpu_waves_per_eu(1, N)` with N from 1 to 4,
   - `__builtin_amdgcn_sched_group_barrier` groups (all VMEM reads then the WMMAs, or interleaved) in the loop body.
 
-  Next steps: compiler options (`-mllvm -amdgpu-schedule-*`), or an inline-asm boundary that keeps the loads in place.
+  Compiler options do change it (`AMD_LLVM_OPTS` adds codegen options, `AMD_WAVES_PER_EU=min,max` adds the kernel attribute):
+
+  | settings | VGPRs | loads issued ahead | ffn_up 256 tokens |
+  |---|---|---|---|
+  | default | 119 | 0 (each pair waited for at its WMMA) | 577us |
+  | `-mllvm -amdgpu-sched-strategy=max-ilp` or `-amdgpu-schedule-relaxed-occupancy=1` | 252 | all | 601us |
+  | `-amdgpu-schedule-relaxed-occupancy=1` + `AMD_WAVES_PER_EU=8,16` | 189 | 18 | 559us |
+
+  The last row is 1-10% faster on every Clef IQ4_XS shape and makes a Clef request 3% faster. Both settings apply to every
+  kernel, and they cost Bonsai PQ2_0 10% of its prefill: they stay opt-in until they can be set per kernel.
 - Prefetch the activation fragments of the next K step in registers: tried and no gain. All 16 fragments (128 VGPRs) spilled.
   One or two K slices fit (the kernel uses 119 VGPRs) but ran 2-5% slower.
